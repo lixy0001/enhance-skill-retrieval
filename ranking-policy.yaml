@@ -1,0 +1,45 @@
+version: 1.0.0
+candidate_retrieval:
+  retained_tag_limit: 3
+  minimum_tag_score: 0.48
+  candidate_limit: 12
+  explicit_skill_name_bypass: true
+  score_weights:
+    semantic_similarity: 0.35
+    positive_example_similarity: 0.25
+    entity_and_artifact_match: 0.20
+    lexical_alias_match: 0.15
+    context_continuity: 0.05
+  hard_filters:
+    - explicit_platform_mismatch
+    - explicit_artifact_mismatch
+    - excluded_action
+final_ranking:
+  selection_count: 1
+  minimum_skill_score: 0.65
+  minimum_winner_margin: 0.05
+  score_weights:
+    description_similarity: 0.30
+    positive_example_similarity: 0.25
+    platform_artifact_action_fit: 0.20
+    explicit_name_match: 0.10
+    context_continuity: 0.10
+    calibrated_success_prior: 0.05
+  failure_mode: none
+reason_codes:
+  invoke:
+    - decisive_match
+    - explicit_skill_name
+  none:
+    - no_candidate_tag
+    - empty_candidate_set
+    - below_skill_threshold
+    - ambiguous_top_candidates
+    - hard_constraint_mismatch
+    - selected_skill_unavailable
+  error:
+    - invalid_index
+    - unsupported_schema_version
+    - classification_failure
+    - ranking_failure
+    - stale_index_rebuild_failed

@@ -1,0 +1,45 @@
+version: 1.0.0
+managed_scope: user_installed
+roots:
+  - id: personal
+    precedence: 300
+    path_candidates:
+      - "${CODEX_HOME}/skills"
+      - "~/.codex/skills"
+    glob: "*/SKILL.md"
+  - id: shared
+    precedence: 200
+    path_candidates:
+      - "~/.agents/skills"
+    glob: "*/SKILL.md"
+  - id: plugin
+    precedence: 100
+    path_candidates:
+      - "${CODEX_HOME}/plugins/cache"
+      - "~/.codex/plugins/cache"
+    glob: "**/skills/*/SKILL.md"
+exclude_path_segments:
+  - .system
+symlink_policy: resolve_within_root_only
+deduplication:
+  key: normalized_skill_id
+  winner_order:
+    - higher_source_precedence
+    - enabled_plugin_version
+    - newest_semantic_version
+    - newest_modified_at
+  retain_shadowed_records: true
+synchronization:
+  triggers:
+    - manager_start
+    - installer_event_when_available
+    - root_fingerprint_change_before_query
+    - periodic_fallback
+  periodic_fallback_seconds: 300
+  fingerprint_fields:
+    - canonical_path
+    - mtime_ns
+    - size_bytes
+  content_hash: sha256
+  update_mode: atomic_incremental
+  on_failure: retain_last_valid_index

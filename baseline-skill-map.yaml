@@ -1,0 +1,71 @@
+snapshot_version: 1.0.0
+snapshot_date: "2026-08-17"
+managed_skill_count: 64
+notes:
+  - This is a routing baseline, not a replacement for generated index records.
+  - Plugin-cache entries may be inactive at runtime; the generated index must set enabled from plugin state.
+skills:
+  - {skill_id: git-submit-push, source: personal, primary_tags: [engineering.version-control]}
+  - {skill_id: hatch-pet, source: personal, primary_tags: [design.visual]}
+  - {skill_id: find-skills, source: shared, primary_tags: [skills.management]}
+  - {skill_id: gpt-taste, source: shared, primary_tags: [design.visual, development.websites]}
+  - {skill_id: stitch-design-taste, source: shared, primary_tags: [design.visual]}
+  - {skill_id: lark-approval, source: shared, primary_tags: [collaboration.approvals]}
+  - {skill_id: lark-apps, source: shared, primary_tags: [development.apps, development.websites]}
+  - {skill_id: lark-attendance, source: shared, primary_tags: [productivity.attendance]}
+  - {skill_id: lark-base, source: shared, primary_tags: [content.spreadsheets]}
+  - {skill_id: lark-calendar, source: shared, primary_tags: [productivity.calendar]}
+  - {skill_id: lark-contact, source: shared, primary_tags: [collaboration.contacts]}
+  - {skill_id: lark-doc, source: shared, primary_tags: [content.documents]}
+  - {skill_id: lark-drive, source: shared, primary_tags: [storage.files]}
+  - {skill_id: lark-event, source: shared, primary_tags: [automation.events]}
+  - {skill_id: lark-im, source: shared, primary_tags: [communication.messaging]}
+  - {skill_id: lark-mail, source: shared, primary_tags: [communication.email]}
+  - {skill_id: lark-markdown, source: shared, primary_tags: [content.documents]}
+  - {skill_id: lark-minutes, source: shared, primary_tags: [collaboration.meetings]}
+  - {skill_id: lark-note, source: shared, primary_tags: [collaboration.meetings]}
+  - {skill_id: lark-okr, source: shared, primary_tags: [productivity.goals]}
+  - {skill_id: lark-openapi-explorer, source: shared, primary_tags: [platform.api]}
+  - {skill_id: lark-shared, source: shared, primary_tags: [platform.api]}
+  - {skill_id: lark-sheets, source: shared, primary_tags: [content.spreadsheets]}
+  - {skill_id: lark-skill-maker, source: shared, primary_tags: [skills.management, platform.api]}
+  - {skill_id: lark-slides, source: shared, primary_tags: [content.presentations]}
+  - {skill_id: lark-task, source: shared, primary_tags: [productivity.tasks]}
+  - {skill_id: lark-vc, source: shared, primary_tags: [collaboration.meetings]}
+  - {skill_id: lark-vc-agent, source: shared, primary_tags: [collaboration.meetings]}
+  - {skill_id: lark-whiteboard, source: shared, primary_tags: [design.visual]}
+  - {skill_id: lark-wiki, source: shared, primary_tags: [content.documents]}
+  - {skill_id: lark-workflow-meeting-summary, source: shared, primary_tags: [collaboration.meetings, analytics.reporting]}
+  - {skill_id: lark-workflow-standup-report, source: shared, primary_tags: [productivity.calendar, productivity.tasks, analytics.reporting]}
+  - {skill_id: control-chrome, source: plugin, primary_tags: [browser.control]}
+  - {skill_id: plugin-management, source: plugin, primary_tags: [skills.management, platform.api]}
+  - {skill_id: sites-hosting, source: plugin, primary_tags: [development.websites]}
+  - {skill_id: control-in-app-browser, source: plugin, primary_tags: [browser.control]}
+  - {skill_id: visualize, source: plugin, primary_tags: [analytics.reporting]}
+  - {skill_id: documents, source: plugin, primary_tags: [content.documents]}
+  - {skill_id: artifact-template-minimal-letterhead, source: plugin, primary_tags: [content.templates, content.documents]}
+  - {skill_id: excel-live-control, source: plugin, primary_tags: [content.spreadsheets]}
+  - {skill_id: sites-building, source: plugin, primary_tags: [development.websites]}
+  - {skill_id: artifact-template-sales-pipeline, source: plugin, primary_tags: [content.templates, content.spreadsheets, business.crm]}
+  - {skill_id: artifact-template-analytics-dashboard, source: plugin, primary_tags: [content.templates, analytics.reporting]}
+  - {skill_id: artifact-template-market-trends-report, source: plugin, primary_tags: [content.templates, analytics.reporting]}
+  - {skill_id: spreadsheets, source: plugin, primary_tags: [content.spreadsheets]}
+  - {skill_id: artifact-template-business-review, source: plugin, primary_tags: [content.templates, analytics.reporting]}
+  - {skill_id: artifact-template-team-alignment, source: plugin, primary_tags: [content.templates, content.presentations]}
+  - {skill_id: artifact-template-simple-light-mode, source: plugin, primary_tags: [content.templates, design.visual]}
+  - {skill_id: artifact-template-three-statement-forecast, source: plugin, primary_tags: [content.templates, content.spreadsheets]}
+  - {skill_id: artifact-template-simple-dark-mode, source: plugin, primary_tags: [content.templates, design.visual]}
+  - {skill_id: artifact-template-operating-review, source: plugin, primary_tags: [content.templates, analytics.reporting]}
+  - {skill_id: pdf, source: plugin, primary_tags: [content.pdf]}
+  - {skill_id: template-creator, source: plugin, primary_tags: [content.templates, skills.management]}
+  - {skill_id: artifact-template-system-design, source: plugin, primary_tags: [content.templates, content.documents]}
+  - {skill_id: artifact-template-project-kickoff, source: plugin, primary_tags: [content.templates, content.presentations]}
+  - {skill_id: artifact-template-investment-committee-memo, source: plugin, primary_tags: [content.templates, content.documents]}
+  - {skill_id: artifact-template-operating-calendar, source: plugin, primary_tags: [content.templates, productivity.calendar]}
+  - {skill_id: artifact-template-project-tracker, source: plugin, primary_tags: [content.templates, productivity.tasks]}
+  - {skill_id: artifact-template-strategy-memorandum, source: plugin, primary_tags: [content.templates, content.documents]}
+  - {skill_id: presentations, source: plugin, primary_tags: [content.presentations]}
+  - {skill_id: artifact-template-financial-budget, source: plugin, primary_tags: [content.templates, content.spreadsheets]}
+  - {skill_id: artifact-template-experiment-analysis, source: plugin, primary_tags: [content.templates, analytics.reporting]}
+  - {skill_id: artifact-template-legal-memorandum, source: plugin, primary_tags: [content.templates, content.documents]}
+  - {skill_id: artifact-template-design-report, source: plugin, primary_tags: [content.templates, design.visual]}
