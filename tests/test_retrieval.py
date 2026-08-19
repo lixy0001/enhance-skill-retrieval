@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "enhance-skill-retrieval" / "scripts"
+CLI = SCRIPTS / "enhance-skill"
 sys.path.insert(0, str(SCRIPTS))
 
 from retrieval_core import (  # noqa: E402
@@ -158,6 +161,53 @@ class RetrievalTests(unittest.TestCase):
                 self.policy,
                 self.provider,
             )
+
+    def run_cli(self, directory, *arguments):
+        environment = dict(os.environ)
+        environment["ENHANCE_SKILL_STATE_DIR"] = str(directory)
+        result = subprocess.run(
+            [sys.executable, str(CLI), "--json", *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        return json.loads(result.stdout)
+
+    def test_stable_cli_lists_and_mutates_tags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            save_state(directory, self.state)
+
+            tags = self.run_cli(directory, "list-tags", "--assigned-only")
+            assigned = {row["tag"]: row["assigned_skill_count"] for row in tags["tags"]}
+            self.assertEqual(1, assigned["productivity.calendar"])
+
+            updated = self.run_cli(
+                directory,
+                "lock-tags",
+                "pdf",
+                "content.documents",
+            )
+            self.assertIn("content.documents", updated["record"]["locked_tags"])
+
+            shown = self.run_cli(directory, "show-tags", "pdf")
+            self.assertIn("content.documents", shown["record"]["effective_tags"])
+
+            matches = self.run_cli(directory, "skills-by-tag", "content.documents")
+            self.assertEqual(["pdf"], matches["skills"])
+
+    def test_stable_cli_reports_uninitialized_status(self):
+        environment = dict(os.environ)
+        environment.pop("ENHANCE_SKILL_STATE_DIR", None)
+        result = subprocess.run(
+            [sys.executable, str(CLI), "--json", "status"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        status = json.loads(result.stdout)
+        self.assertFalse(status["initialized"])
 
 
 if __name__ == "__main__":

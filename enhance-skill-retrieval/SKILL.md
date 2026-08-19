@@ -11,11 +11,28 @@ Keep the harness registry as the source of truth for Skill metadata. Persist onl
 
 - Initialize a tag library from the harness's complete current catalog: run `scripts/manage_tags.py initialize`.
 - Apply a normal harness install, update, or removal event: run `scripts/manage_tags.py sync`.
-- Add, remove, lock, unlock, inspect, or reclassify tags: run `scripts/manage_tags.py` with the matching subcommand.
+- Let users inspect and edit tags through the stable `enhance-skill` command in `scripts/enhance-skill`.
 - Route a user request when the harness catalog exceeds its activation threshold: run `scripts/route_query.py`.
 - Measure retrieval behavior against JSONL cases: run `scripts/evaluate_retrieval.py`.
 
 Read [references/protocol.md](references/protocol.md) before integrating a new harness. Read [references/tag-taxonomy.yaml](references/tag-taxonomy.yaml) only when changing controlled tags or reviewing classification.
+
+## Use the stable tag commands
+
+Expose `scripts/enhance-skill` on `PATH` as `enhance-skill` and set `ENHANCE_SKILL_STATE_DIR` to the harness-owned state directory. Use only these public tag-management subcommands:
+
+- `enhance-skill status`
+- `enhance-skill list-tags [--assigned-only]`
+- `enhance-skill list-skills`
+- `enhance-skill show-tags <skill-id>`
+- `enhance-skill skills-by-tag <tag>`
+- `enhance-skill add-tags <skill-id> <tag>...`
+- `enhance-skill remove-tags <skill-id> <tag>...`
+- `enhance-skill lock-tags <skill-id> <tag>...`
+- `enhance-skill unlock-tags <skill-id> <tag>...`
+- `enhance-skill reclassify-tags <skill-id> --input <skill.json>`
+
+Add `--json` before the subcommand for structured output. Keep `manage_tags.py` as the harness integration interface for initialization and lifecycle synchronization; do not expose its shorter internal mutation names as additional user commands.
 
 ## Preserve ownership boundaries
 

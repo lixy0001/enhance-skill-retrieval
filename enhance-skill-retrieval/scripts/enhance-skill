@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Stable command-line interface for inspecting and editing Skill tags."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from typing import Any, Dict, Mapping
+
+from retrieval_core import (
+    load_resources,
+    load_state,
+    mutate_tags,
+    reclassify_record,
+    read_json,
+    save_state,
+    state_path,
+)
+
+
+STATE_ENV = "ENHANCE_SKILL_STATE_DIR"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="enhance-skill",
+        description="Inspect and edit tags used by enhance-skill-retrieval.",
+    )
+    parser.add_argument(
+        "--state-dir",
+        help=f"Harness state directory; defaults to ${STATE_ENV}",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    list_tags = sub.add_parser("list-tags", help="List controlled tags and assignment counts")
+    list_tags.add_argument("--assigned-only", action="store_true")
+
+    sub.add_parser("list-skills", help="List Skill IDs and their effective tags")
+
+    show = sub.add_parser("show-tags", help="Show all tag sources for one Skill")
+    show.add_argument("skill_id")
+
+    by_tag = sub.add_parser("skills-by-tag", help="List Skills assigned to a tag")
+    by_tag.add_argument("tag")
+
+    for command, help_text in (
+        ("add-tags", "Add manual tags to a Skill"),
+        ("remove-tags", "Remove manual tags from a Skill"),
+        ("lock-tags", "Add and lock manual tags on a Skill"),
+        ("unlock-tags", "Unlock tags while retaining them as manual tags"),
+    ):
+        item = sub.add_parser(command, help=help_text)
+        item.add_argument("skill_id")
+        item.add_argument("tags", nargs="+")
+
+    reclassify = sub.add_parser("reclassify-tags", help="Regenerate automatic tags from Skill metadata")
+    reclassify.add_argument("skill_id")
+    reclassify.add_argument("--input", default="-", help="JSON Skill object; defaults to stdin")
+
+    sub.add_parser("status", help="Show tag-library status and activation threshold")
+    return parser
+
+
+def resolve_state_dir(value: str | None) -> str | None:
+    return value or os.environ.get(STATE_ENV)
+
+
+def require_state_dir(value: str | None) -> str:
+    resolved = resolve_state_dir(value)
+    if not resolved:
+        raise ValueError(f"set {STATE_ENV} or pass --state-dir")
+    return resolved
+
+
+def count_assignments(state: Mapping[str, Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for record in state.get("skills", {}).values():
+        for tag in record.get("effective_tags", []):
+            counts[tag] = counts.get(tag, 0) + 1
+    return counts
+
+
+def list_tag_rows(taxonomy: Mapping[str, Any], state: Mapping[str, Any]) -> list[Dict[str, Any]]:
+    counts = count_assignments(state)
+    controlled = {item["id"] for item in taxonomy.get("tags", [])}
+    rows = [
+        {
+            "tag": item["id"],
+            "name": item.get("name_zh", ""),
+            "controlled": True,
+            "assigned_skill_count": counts.get(item["id"], 0),
+        }
+        for item in taxonomy.get("tags", [])
+    ]
+    rows.extend(
+        {
+            "tag": tag,
+            "name": "",
+            "controlled": False,
+            "assigned_skill_count": count,
+        }
+        for tag, count in sorted(counts.items())
+        if tag not in controlled
+    )
+    return rows
+
+
+def emit(data: Mapping[str, Any], as_json: bool) -> None:
+    if as_json:
+        json.dump(data, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return
+
+    kind = data.get("kind")
+    if kind == "tags":
+        print("TAG\tNAME\tTYPE\tSKILLS")
+        for row in data["tags"]:
+            print(
+                f"{row['tag']}\t{row['name']}\t"
+                f"{'controlled' if row['controlled'] else 'auxiliary'}\t"
+                f"{row['assigned_skill_count']}"
+            )
+    elif kind == "skills":
+        print("SKILL\tEFFECTIVE TAGS")
+        for skill_id, tags in data["skills"].items():
+            print(f"{skill_id}\t{', '.join(tags) or '-'}")
+    elif kind == "skill-tags":
+        print(f"Skill: {data['skill_id']}")
+        for field in ("locked_tags", "manual_tags", "native_tags", "agent_tags", "effective_tags"):
+            print(f"{field}: {', '.join(data['record'].get(field, [])) or '-'}")
+        reason = data["record"].get("classification_reason", "")
+        if reason:
+            print(f"classification_reason: {reason}")
+    elif kind == "skills-by-tag":
+        print(f"Tag: {data['tag']}")
+        for skill_id in data["skills"]:
+            print(skill_id)
+    elif kind == "status":
+        print(f"initialized: {'yes' if data['initialized'] else 'no'}")
+        print(f"state_file: {data['state_file']}")
+        print(f"skill_count: {data['skill_count']}")
+        print(f"activation_threshold: {data['activation_threshold']}")
+        print(f"tag_retrieval: {data['tag_retrieval']}")
+    else:
+        print(f"Skill: {data['skill_id']}")
+        print(f"status: {data['status']}")
+        print(f"effective_tags: {', '.join(data['record'].get('effective_tags', [])) or '-'}")
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    taxonomy, policy, provider = load_resources()
+    state_dir = resolve_state_dir(args.state_dir)
+
+    if args.command == "list-tags":
+        state = load_state(state_dir, required=False) if state_dir else {"skills": {}}
+        rows = list_tag_rows(taxonomy, state)
+        if args.assigned_only:
+            rows = [row for row in rows if row["assigned_skill_count"]]
+        output: Dict[str, Any] = {"kind": "tags", "tags": rows}
+    elif args.command == "status":
+        if state_dir:
+            path = state_path(state_dir)
+            initialized = path.exists()
+            state = load_state(state_dir, required=False)
+            state_file = str(path)
+        else:
+            initialized = False
+            state = {"skills": {}}
+            state_file = f"unset (set {STATE_ENV})"
+        skill_count = len(state.get("skills", {}))
+        threshold = int(policy["activation_threshold"])
+        output = {
+            "kind": "status",
+            "initialized": initialized,
+            "state_file": state_file,
+            "skill_count": skill_count,
+            "activation_threshold": threshold,
+            "tag_retrieval": "enabled" if skill_count > threshold else "bypass",
+        }
+    else:
+        state_dir = require_state_dir(args.state_dir)
+        state = load_state(state_dir)
+        if args.command == "list-skills":
+            output = {
+                "kind": "skills",
+                "skills": {
+                    skill_id: record.get("effective_tags", [])
+                    for skill_id, record in sorted(state.get("skills", {}).items())
+                },
+            }
+        elif args.command == "show-tags":
+            record = state.get("skills", {}).get(args.skill_id)
+            if record is None:
+                raise KeyError(f"unknown skill_id: {args.skill_id}")
+            output = {"kind": "skill-tags", "skill_id": args.skill_id, "record": record}
+        elif args.command == "skills-by-tag":
+            matches = sorted(
+                skill_id
+                for skill_id, record in state.get("skills", {}).items()
+                if args.tag in record.get("effective_tags", [])
+            )
+            output = {"kind": "skills-by-tag", "tag": args.tag, "skills": matches}
+        elif args.command == "reclassify-tags":
+            skill = read_json(args.input)
+            if skill.get("skill_id") != args.skill_id:
+                raise ValueError("input requires a matching Skill object")
+            record = reclassify_record(state, skill, taxonomy, provider)
+            save_state(state_dir, state)
+            output = {"kind": "updated", "status": "reclassified", "skill_id": args.skill_id, "record": record}
+        else:
+            action = {
+                "add-tags": "add",
+                "remove-tags": "remove",
+                "lock-tags": "lock",
+                "unlock-tags": "unlock",
+            }[args.command]
+            record = mutate_tags(state, args.skill_id, action, args.tags)
+            save_state(state_dir, state)
+            output = {"kind": "updated", "status": args.command, "skill_id": args.skill_id, "record": record}
+
+    emit(output, args.json)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (FileNotFoundError, KeyError, ValueError) as error:
+        print(f"enhance-skill: {error}", file=sys.stderr)
+        raise SystemExit(2)

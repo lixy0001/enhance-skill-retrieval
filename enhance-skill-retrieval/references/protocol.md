@@ -33,7 +33,22 @@ Supported events are `skill_added`, `skill_updated`, and `skill_removed`. A remo
 
 ### Edit tags
 
-Use `manage_tags.py add`, `remove`, `lock`, or `unlock`. Manual tags override generated tags. Locked tags survive metadata updates.
+Expose `scripts/enhance-skill` on `PATH` and set `ENHANCE_SKILL_STATE_DIR` to the harness-owned state directory. The stable user commands are:
+
+```text
+enhance-skill status
+enhance-skill list-tags [--assigned-only]
+enhance-skill list-skills
+enhance-skill show-tags <skill-id>
+enhance-skill skills-by-tag <tag>
+enhance-skill add-tags <skill-id> <tag>...
+enhance-skill remove-tags <skill-id> <tag>...
+enhance-skill lock-tags <skill-id> <tag>...
+enhance-skill unlock-tags <skill-id> <tag>...
+enhance-skill reclassify-tags <skill-id> --input <skill.json>
+```
+
+Pass `--json` before the subcommand for structured output. Manual tags override generated tags. Locked tags survive metadata updates. `unlock-tags` retains the tag as manual; use `remove-tags` to delete the manual assignment.
 
 ### Route
 

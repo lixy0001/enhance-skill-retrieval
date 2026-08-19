@@ -20,3 +20,17 @@ python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py enhance-
 官方 `quick_validate.py` 需要运行环境提供 PyYAML；Skill 本身只使用 Python 标准库。
 
 动态标签状态由 harness 指定 `state_dir`，不会写入已安装 Skill，也不会修改其他 Skills。
+
+## 固定标签命令
+
+将 `enhance-skill-retrieval/scripts` 加入 `PATH`，并由 harness 设置标签状态目录：
+
+```bash
+export ENHANCE_SKILL_STATE_DIR=/path/to/harness/state
+enhance-skill status
+enhance-skill list-tags
+enhance-skill show-tags lark-calendar
+enhance-skill lock-tags lark-calendar productivity.calendar
+```
+
+顶级命令 `enhance-skill` 已检查未与当前环境中的命令重复。完整子命令以 `enhance-skill --help` 为准。
