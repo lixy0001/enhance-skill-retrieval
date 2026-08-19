@@ -1,0 +1,24 @@
+{
+  "registry_version": "fixture-v1",
+  "skills": [
+    {
+      "skill_id": "lark-calendar",
+      "name": "lark-calendar",
+      "description": "Manage calendars, future events, availability, and meeting rooms. 管理日历日程会议室。",
+      "tags": ["productivity.calendar"],
+      "aliases": ["日历", "日程", "会议室"]
+    },
+    {
+      "skill_id": "lark-vc",
+      "name": "lark-vc",
+      "description": "Search historical meetings, minutes, participants, and transcripts.",
+      "tags": ["collaboration.meetings"]
+    },
+    {
+      "skill_id": "pdf",
+      "name": "pdf",
+      "description": "Read, create, inspect, render, and fill PDF files.",
+      "tags": ["content.pdf"]
+    }
+  ]
+}

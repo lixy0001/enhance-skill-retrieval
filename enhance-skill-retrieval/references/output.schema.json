@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Skill retrieval enhancer result",
+  "type": "object",
+  "required": ["decision", "selected_skill_id", "reason_codes"],
+  "properties": {
+    "decision": {"enum": ["invoke", "none", "bypass", "error"]},
+    "selected_skill_id": {"type": ["string", "null"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "matched_tags": {"type": "array", "items": {"type": "string"}},
+    "candidate_skill_ids": {"type": "array", "items": {"type": "string"}},
+    "reason_codes": {"type": "array", "items": {"type": "string"}},
+    "registry_version": {"type": "string"}
+  }
+}

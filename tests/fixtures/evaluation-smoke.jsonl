@@ -1,0 +1,1 @@
+{"id":"S001","group":"invoke-current","prompt":"预订明天下午的会议室并更新日历日程","expected_decision":"invoke","expected_skill":"lark-calendar"}

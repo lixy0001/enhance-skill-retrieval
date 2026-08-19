@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0",
+  "activation_threshold": 80,
+  "tag_top_k": 5,
+  "minimum_tag_score": 0.28,
+  "candidate_skill_limit": 32,
+  "minimum_skill_score": 0.42,
+  "minimum_winner_margin": 0.04,
+  "embedding_provider": "local-hash-v1",
+  "embedding_dimensions": 512
+}
