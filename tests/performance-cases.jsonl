@@ -1,0 +1,8 @@
+{"id":"perf-calendar-zh","prompt":"预订明天下午的会议室并更新日历日程","expected_decision":"invoke","expected_skill":"lark-calendar"}
+{"id":"perf-calendar-en","prompt":"Move tomorrow's calendar event to 3 PM","expected_decision":"invoke","expected_skill":"lark-calendar"}
+{"id":"perf-calendar-room","prompt":"Find an available meeting room for a future event","expected_decision":"invoke","expected_skill":"lark-calendar"}
+{"id":"perf-meeting-history","prompt":"Search the historical meeting transcript and minutes","expected_decision":"invoke","expected_skill":"lark-vc"}
+{"id":"perf-meeting-zh","prompt":"查看昨天视频会议的纪要和逐字稿","expected_decision":"invoke","expected_skill":"lark-vc"}
+{"id":"perf-pdf-read","prompt":"Read and inspect this PDF file","expected_decision":"invoke","expected_skill":"pdf"}
+{"id":"perf-pdf-fill","prompt":"Fill and render a PDF form","expected_decision":"invoke","expected_skill":"pdf"}
+{"id":"perf-explicit","prompt":"Use lark-calendar to check my schedule","expected_decision":"invoke","expected_skill":"lark-calendar"}
