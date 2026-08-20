@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 
-from retrieval_core import load_resources, load_state, read_json, route, write_json
+from retrieval_core import load_feedback_state, load_resources, load_state, read_json, route, write_json
 
 
 def main() -> int:
@@ -21,13 +21,15 @@ def main() -> int:
             state = {"skills": {}}
         else:
             state = load_state(args.state_dir)
-        result = route(payload, state, taxonomy, policy, provider)
+        feedback = load_feedback_state(args.state_dir)
+        result = route(payload, state, taxonomy, policy, provider, feedback)
     except Exception as error:
         result = {
             "decision": "error",
             "selected_skill_id": None,
             "confidence": 0.0,
             "matched_tags": [],
+            "feedback_tags": [],
             "candidate_skill_ids": [],
             "reason_codes": [type(error).__name__, str(error)],
             "registry_version": "",

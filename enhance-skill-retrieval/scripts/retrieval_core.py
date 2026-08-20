@@ -15,6 +15,8 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence,
 
 SCHEMA_VERSION = "1.0.0"
 DEFAULT_STATE_FILE = "skill-tags.yaml"
+FEEDBACK_SCHEMA_VERSION = "1.1.0"
+DEFAULT_FEEDBACK_FILE = "feedback-stats.json"
 
 
 def read_json(path: str | None) -> Dict[str, Any]:
@@ -78,6 +80,355 @@ def load_state(state_dir: str, required: bool = True) -> Dict[str, Any]:
 
 def save_state(state_dir: str, state: Mapping[str, Any]) -> None:
     atomic_write_json_yaml(state_path(state_dir), state)
+
+
+def feedback_path(state_dir: str) -> Path:
+    return Path(state_dir).expanduser().resolve() / DEFAULT_FEEDBACK_FILE
+
+
+def empty_feedback_state() -> Dict[str, Any]:
+    return {
+        "schema_version": FEEDBACK_SCHEMA_VERSION,
+        "total_responses": 0,
+        "skills": {},
+        "tag_skill": {},
+        "rerank_skills": {},
+        "query_tag_corrections": {},
+        "annotation_suggestions": {},
+        "tag_rejections": {},
+        "root_causes": {},
+        "pending": {},
+    }
+
+
+def load_feedback_state(state_dir: str, required: bool = False) -> Dict[str, Any]:
+    path = feedback_path(state_dir)
+    if not path.exists():
+        if required:
+            raise FileNotFoundError(f"feedback state not initialized: {path}")
+        return empty_feedback_state()
+    state = load_json_yaml(path)
+    if state.get("schema_version") == "1.0.0":
+        state["schema_version"] = FEEDBACK_SCHEMA_VERSION
+        for key, value in empty_feedback_state().items():
+            state.setdefault(key, value)
+    elif state.get("schema_version") != FEEDBACK_SCHEMA_VERSION:
+        raise ValueError("unsupported feedback-state schema version")
+    return state
+
+
+def save_feedback_state(state_dir: str, state: Mapping[str, Any]) -> None:
+    atomic_write_json_yaml(feedback_path(state_dir), state)
+
+
+def should_request_feedback(interaction_id: str, sample_rate: float, salt: str = "") -> bool:
+    if not interaction_id:
+        raise ValueError("interaction_id must not be empty")
+    if sample_rate < 0.0 or sample_rate > 1.0:
+        raise ValueError("feedback sample rate must be between 0 and 1")
+    digest = hashlib.sha256(f"{salt}\0{interaction_id}".encode("utf-8")).digest()
+    bucket = int.from_bytes(digest[:8], "big") / float(1 << 64)
+    return bucket < sample_rate
+
+
+def record_feedback(
+    state: MutableMapping[str, Any], skill_id: str, tags: Iterable[str], accurate: bool
+) -> Dict[str, Any]:
+    if not skill_id:
+        raise ValueError("skill_id must not be empty")
+    field = "positive" if accurate else "negative"
+    state["total_responses"] = int(state.get("total_responses", 0)) + 1
+    skill_counts = state.setdefault("skills", {}).setdefault(
+        skill_id, {"positive": 0, "negative": 0}
+    )
+    skill_counts[field] = int(skill_counts.get(field, 0)) + 1
+    for tag in unique_strings(tags):
+        pair_counts = state.setdefault("tag_skill", {}).setdefault(tag, {}).setdefault(
+            skill_id, {"positive": 0, "negative": 0}
+        )
+        pair_counts[field] = int(pair_counts.get(field, 0)) + 1
+    return {
+        "skill_id": skill_id,
+        "rating": "accurate" if accurate else "inaccurate",
+        "skill_counts": dict(skill_counts),
+    }
+
+
+def increment_counts(container: MutableMapping[str, Any], key: str, positive: bool) -> Dict[str, int]:
+    counts = container.setdefault(key, {"positive": 0, "negative": 0})
+    field = "positive" if positive else "negative"
+    counts[field] = int(counts.get(field, 0)) + 1
+    return counts
+
+
+def feedback_interaction_key(interaction_id: str, salt: str = "") -> str:
+    if not interaction_id:
+        raise ValueError("interaction_id must not be empty")
+    return "sha256:" + hashlib.sha256(f"{salt}\0{interaction_id}".encode("utf-8")).hexdigest()
+
+
+def register_feedback_request(
+    state: MutableMapping[str, Any],
+    interaction_id: str,
+    route_result: Mapping[str, Any],
+    query_vector: Sequence[float],
+    sample_rate: float,
+    salt: str = "",
+    pending_limit: int = 1000,
+) -> bool:
+    sampled = should_request_feedback(interaction_id, sample_rate, salt)
+    if not sampled:
+        return False
+    pending = state.setdefault("pending", {})
+    key = feedback_interaction_key(interaction_id, salt)
+    pending[key] = {
+        "selected_skill_id": route_result["selected_skill_id"],
+        "matched_tags": unique_strings(route_result.get("matched_tags", [])),
+        "feedback_tags": unique_strings(route_result.get("feedback_tags", [])),
+        "candidate_skill_ids": unique_strings(route_result.get("candidate_skill_ids", [])),
+        "query_vector": [round(float(value), 8) for value in query_vector],
+    }
+    while len(pending) > max(1, pending_limit):
+        del pending[next(iter(pending))]
+    return True
+
+
+def record_pending_feedback(
+    state: MutableMapping[str, Any],
+    interaction_id: str,
+    accurate: bool,
+    tag_state: Mapping[str, Any],
+    expected_skill_id: str | None = None,
+    expected_tags: Iterable[str] = (),
+    expected_none: bool = False,
+    salt: str = "",
+) -> Dict[str, Any]:
+    key = feedback_interaction_key(interaction_id, salt)
+    pending = state.setdefault("pending", {})
+    request = pending.get(key)
+    if request is None:
+        raise ValueError("feedback request is missing, expired, or already answered")
+    if not accurate and not expected_none:
+        if not expected_skill_id or expected_skill_id not in tag_state.get("skills", {}):
+            raise ValueError("inaccurate feedback requires a known expected_skill_id or expected_none")
+        if not unique_strings(expected_tags):
+            raise ValueError("inaccurate feedback requires expected_tags")
+    del pending[key]
+    selected_skill_id = str(request["selected_skill_id"])
+    selected_tags = unique_strings(request.get("feedback_tags", []))
+    state["total_responses"] = int(state.get("total_responses", 0)) + 1
+    increment_counts(state.setdefault("skills", {}), selected_skill_id, accurate)
+    if accurate:
+        for tag in selected_tags:
+            increment_counts(
+                state.setdefault("tag_skill", {}).setdefault(tag, {}),
+                selected_skill_id,
+                True,
+            )
+        return {
+            "skill_id": selected_skill_id,
+            "rating": "accurate",
+            "root_causes": ["accurate_selection"],
+            "skill_counts": dict(state["skills"][selected_skill_id]),
+        }
+
+    if expected_none:
+        for tag in unique_strings(request.get("matched_tags", [])):
+            state.setdefault("tag_rejections", {})[tag] = int(
+                state.setdefault("tag_rejections", {}).get(tag, 0)
+            ) + 1
+        root_causes = ["over_recall"]
+    else:
+        intent_tags = set(unique_strings(expected_tags))
+        matched_tags = set(request.get("matched_tags", []))
+        correct_skill_tags = set(
+            tag_state["skills"][expected_skill_id].get("effective_tags", [])
+        )
+        candidates = set(request.get("candidate_skill_ids", []))
+        missed_query_tags = intent_tags - matched_tags
+        missing_skill_tags = intent_tags - correct_skill_tags
+        root_causes: List[str] = []
+
+        if missed_query_tags:
+            root_causes.append("query_tag_mismatch")
+            wrong_tags = (matched_tags - intent_tags) or {"__none__"}
+            for wrong_tag in wrong_tags:
+                for expected_tag in missed_query_tags:
+                    update_query_tag_correction(
+                        state,
+                        wrong_tag,
+                        expected_tag,
+                        request.get("query_vector", []),
+                    )
+
+        if missing_skill_tags:
+            root_causes.append("skill_tag_annotation_error")
+            suggestions = state.setdefault("annotation_suggestions", {}).setdefault(
+                expected_skill_id, {}
+            )
+            for tag in missing_skill_tags:
+                suggestions[tag] = int(suggestions.get(tag, 0)) + 1
+
+        if expected_skill_id in candidates and expected_skill_id != selected_skill_id:
+            root_causes.append("skill_rerank_error")
+            increment_counts(state.setdefault("rerank_skills", {}), selected_skill_id, False)
+            increment_counts(state.setdefault("rerank_skills", {}), expected_skill_id, True)
+        elif expected_skill_id not in candidates:
+            root_causes.append("candidate_recall_error")
+            for tag in selected_tags:
+                increment_counts(
+                    state.setdefault("tag_skill", {}).setdefault(tag, {}),
+                    selected_skill_id,
+                    False,
+                )
+
+        if not root_causes:
+            root_causes.append("unclassified_negative")
+
+    for cause in root_causes:
+        state.setdefault("root_causes", {})[cause] = int(
+            state.setdefault("root_causes", {}).get(cause, 0)
+        ) + 1
+    return {
+        "skill_id": selected_skill_id,
+        "expected_skill_id": expected_skill_id,
+        "rating": "inaccurate",
+        "root_causes": root_causes,
+        "skill_counts": dict(state["skills"][selected_skill_id]),
+    }
+
+
+def update_query_tag_correction(
+    state: MutableMapping[str, Any], wrong_tag: str, expected_tag: str, vector: Sequence[float]
+) -> None:
+    if not vector:
+        return
+    correction = state.setdefault("query_tag_corrections", {}).setdefault(
+        wrong_tag, {}
+    ).setdefault(expected_tag, {"samples": 0, "centroid": [0.0] * len(vector)})
+    samples = int(correction.get("samples", 0))
+    centroid = correction.get("centroid", [])
+    if len(centroid) != len(vector):
+        centroid = [0.0] * len(vector)
+        samples = 0
+    combined = [centroid[index] * samples + float(value) for index, value in enumerate(vector)]
+    norm = math.sqrt(sum(value * value for value in combined))
+    correction["centroid"] = [round(value / norm, 8) for value in combined] if norm else combined
+    correction["samples"] = samples + 1
+
+
+def remove_skill_feedback(state: MutableMapping[str, Any], skill_id: str) -> None:
+    state.setdefault("skills", {}).pop(skill_id, None)
+    for tag in list(state.setdefault("tag_skill", {})):
+        state["tag_skill"][tag].pop(skill_id, None)
+        if not state["tag_skill"][tag]:
+            del state["tag_skill"][tag]
+    for key in list(state.setdefault("pending", {})):
+        request = state["pending"][key]
+        if request.get("selected_skill_id") == skill_id or skill_id in request.get(
+            "candidate_skill_ids", []
+        ):
+            del state["pending"][key]
+    state.setdefault("rerank_skills", {}).pop(skill_id, None)
+    state.setdefault("annotation_suggestions", {}).pop(skill_id, None)
+
+
+def feedback_count_adjustment(counts: Mapping[str, Any], policy: Mapping[str, Any]) -> float:
+    positive = int(counts.get("positive", 0))
+    negative = int(counts.get("negative", 0))
+    total = positive + negative
+    minimum = int(policy.get("feedback_min_samples", 5))
+    if total < minimum:
+        return 0.0
+    prior = float(policy.get("feedback_prior_strength", 6.0))
+    posterior = (positive + 0.5 * prior) / (total + prior)
+    confidence = min(1.0, total / max(1.0, minimum * 2.0))
+    maximum = float(policy.get("feedback_max_adjustment", 0.08))
+    return max(-maximum, min(maximum, (posterior - 0.5) * 2.0 * maximum * confidence))
+
+
+def feedback_adjustment(
+    feedback: Mapping[str, Any] | None,
+    skill_id: str,
+    matched_tags: Iterable[str],
+    policy: Mapping[str, Any],
+) -> float:
+    if not feedback:
+        return 0.0
+    pair_adjustments = [
+        feedback_count_adjustment(
+            feedback.get("tag_skill", {}).get(tag, {}).get(skill_id, {}), policy
+        )
+        for tag in unique_strings(matched_tags)
+    ]
+    active_pairs = [value for value in pair_adjustments if value]
+    if not active_pairs:
+        return 0.0
+    return sum(active_pairs) / len(active_pairs)
+
+
+def rerank_feedback_adjustment(
+    feedback: Mapping[str, Any] | None, skill_id: str, policy: Mapping[str, Any]
+) -> float:
+    if not feedback:
+        return 0.0
+    return feedback_count_adjustment(
+        feedback.get("rerank_skills", {}).get(skill_id, {}), policy
+    )
+
+
+def candidate_effective_tags(
+    record: Mapping[str, Any],
+    feedback: Mapping[str, Any] | None,
+    skill_id: str,
+    policy: Mapping[str, Any],
+) -> List[str]:
+    tags = list(record.get("effective_tags", []))
+    if not feedback:
+        return unique_strings(tags)
+    minimum = int(policy.get("feedback_min_samples", 5))
+    suggestions = feedback.get("annotation_suggestions", {}).get(skill_id, {})
+    tags.extend(tag for tag, count in suggestions.items() if int(count) >= minimum)
+    return unique_strings(tags)
+
+
+def corrected_tag_scores(
+    query_vector: Sequence[float],
+    scores: Mapping[str, float],
+    feedback: Mapping[str, Any] | None,
+    policy: Mapping[str, Any],
+) -> Tuple[Dict[str, float], bool]:
+    corrected = dict(scores)
+    if not feedback:
+        return corrected, False
+    minimum = int(policy.get("feedback_min_samples", 5))
+    similarity_threshold = float(policy.get("feedback_query_similarity", 0.55))
+    maximum = float(policy.get("feedback_tag_max_adjustment", 0.12))
+    applied = False
+    for wrong_tag, expected_map in feedback.get("query_tag_corrections", {}).items():
+        if wrong_tag != "__none__" and corrected.get(wrong_tag, 0.0) <= 0.0:
+            continue
+        for expected_tag, correction in expected_map.items():
+            samples = int(correction.get("samples", 0))
+            centroid = correction.get("centroid", [])
+            if samples < minimum or len(centroid) != len(query_vector):
+                continue
+            similarity = cosine(query_vector, centroid)
+            if similarity < similarity_threshold:
+                continue
+            confidence = min(1.0, samples / max(1.0, minimum * 2.0))
+            adjustment = maximum * confidence * similarity
+            corrected[expected_tag] = min(1.0, corrected.get(expected_tag, 0.0) + adjustment)
+            if wrong_tag != "__none__":
+                corrected[wrong_tag] = max(0.0, corrected.get(wrong_tag, 0.0) - adjustment * 0.5)
+            applied = True
+    for tag, count in feedback.get("tag_rejections", {}).items():
+        if int(count) < minimum or tag not in corrected:
+            continue
+        confidence = min(1.0, int(count) / max(1.0, minimum * 2.0))
+        corrected[tag] = max(0.0, corrected[tag] - maximum * confidence)
+        applied = True
+    return corrected, applied
 
 
 def canonical_json(value: Any) -> str:
@@ -334,12 +685,36 @@ def reclassify_record(
     return record
 
 
+def metadata_match_score(
+    query: str,
+    query_vector: Sequence[float],
+    skill: Mapping[str, Any],
+    provider: HashEmbeddingProvider,
+    extra_tags: Iterable[str] = (),
+    affinity: float = 0.0,
+) -> float:
+    metadata_text = " ".join(
+        [str(skill.get("name", "")), str(skill.get("description", ""))]
+        + [str(alias) for alias in skill.get("aliases", [])]
+        + [str(tag) for tag in skill.get("tags", [])]
+        + list(extra_tags)
+    )
+    semantic = cosine(query_vector, provider.embed(metadata_text))
+    query_features = set(text_features(query))
+    metadata_features = set(text_features(metadata_text))
+    lexical = len(query_features & metadata_features) / max(1, len(query_features))
+    calibrated_semantic = min(1.0, semantic * 1.5)
+    calibrated_affinity = min(1.0, affinity * 1.4)
+    return min(1.0, 0.58 * calibrated_semantic + 0.22 * lexical + 0.20 * calibrated_affinity)
+
+
 def route(
     payload: Mapping[str, Any],
     state: Mapping[str, Any],
     taxonomy: Mapping[str, Any],
     policy: Mapping[str, Any],
     provider: HashEmbeddingProvider,
+    feedback: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     skills = payload.get("skills")
     query = payload.get("query")
@@ -353,6 +728,7 @@ def route(
             "selected_skill_id": None,
             "confidence": 0.0,
             "matched_tags": [],
+            "feedback_tags": [],
             "candidate_skill_ids": [],
             "reason_codes": ["below_activation_threshold"],
             "registry_version": registry_version,
@@ -375,6 +751,7 @@ def route(
                 "selected_skill_id": skill_id,
                 "confidence": 1.0,
                 "matched_tags": list(records[skill_id].get("effective_tags", [])),
+                "feedback_tags": [],
                 "candidate_skill_ids": [skill_id],
                 "reason_codes": ["explicit_skill_name"],
                 "registry_version": registry_version,
@@ -382,11 +759,16 @@ def route(
 
     controlled = taxonomy_by_id(taxonomy)
     query_vector = provider.embed(query)
-    tag_scores: List[Tuple[float, str]] = []
+    base_tag_scores: Dict[str, float] = {}
     for tag_id, tag in controlled.items():
         semantic = cosine(query_vector, provider.embed(tag_text(tag)))
         lexical = lexical_alias_score(query, tag.get("aliases", []))
-        score = 0.72 * semantic + 0.28 * lexical
+        base_tag_scores[tag_id] = 0.72 * semantic + 0.28 * lexical
+    adjusted_tag_scores, query_tag_feedback_applied = corrected_tag_scores(
+        query_vector, base_tag_scores, feedback, policy
+    )
+    tag_scores: List[Tuple[float, str]] = []
+    for tag_id, score in adjusted_tag_scores.items():
         if score >= float(policy["minimum_tag_score"]):
             tag_scores.append((score, tag_id))
     tag_scores.sort(reverse=True)
@@ -397,6 +779,7 @@ def route(
             "selected_skill_id": None,
             "confidence": 0.0,
             "matched_tags": [],
+            "feedback_tags": [],
             "candidate_skill_ids": [],
             "reason_codes": ["no_candidate_tag"],
             "registry_version": registry_version,
@@ -404,10 +787,19 @@ def route(
 
     tag_score_map = dict((tag_id, score) for score, tag_id in retained_tags)
     preliminary: List[Tuple[float, str]] = []
+    candidate_tags_by_skill: Dict[str, List[str]] = {}
+    annotation_feedback_applied = False
     for skill_id in catalog:
-        matched = set(records[skill_id].get("effective_tags", [])) & set(tag_score_map)
+        candidate_tags = candidate_effective_tags(records[skill_id], feedback, skill_id, policy)
+        candidate_tags_by_skill[skill_id] = candidate_tags
+        added_tags = set(candidate_tags) - set(records[skill_id].get("effective_tags", []))
+        if added_tags & set(tag_score_map):
+            annotation_feedback_applied = True
+        matched = set(candidate_tags) & set(tag_score_map)
         if matched:
-            preliminary.append((max(tag_score_map[tag] for tag in matched), skill_id))
+            base_affinity = max(tag_score_map[tag] for tag in matched)
+            adjustment = feedback_adjustment(feedback, skill_id, matched, policy)
+            preliminary.append((max(0.0, min(1.0, base_affinity + adjustment)), skill_id))
     preliminary.sort(reverse=True)
     candidate_ids = [skill_id for _, skill_id in preliminary[: int(policy["candidate_skill_limit"])]]
     if not candidate_ids:
@@ -416,29 +808,32 @@ def route(
             "selected_skill_id": None,
             "confidence": 0.0,
             "matched_tags": [tag_id for _, tag_id in retained_tags],
+            "feedback_tags": [],
             "candidate_skill_ids": [],
             "reason_codes": ["empty_candidate_set"],
             "registry_version": registry_version,
         }
 
-    query_features = set(text_features(query))
     ranked: List[Tuple[float, str]] = []
+    rerank_feedback_applied = False
     for skill_id in candidate_ids:
         skill = catalog[skill_id]
         record = records[skill_id]
-        metadata_text = " ".join(
-            [str(skill.get("name", "")), str(skill.get("description", ""))]
-            + [str(alias) for alias in skill.get("aliases", [])]
-            + list(record.get("effective_tags", []))
-        )
-        semantic = cosine(query_vector, provider.embed(metadata_text))
-        metadata_features = set(text_features(metadata_text))
-        lexical = len(query_features & metadata_features) / max(1, len(query_features))
-        matched = set(record.get("effective_tags", [])) & set(tag_score_map)
+        candidate_tags = candidate_tags_by_skill[skill_id]
+        matched = set(candidate_tags) & set(tag_score_map)
         affinity = max((tag_score_map[tag] for tag in matched), default=0.0)
-        calibrated_semantic = min(1.0, semantic * 1.5)
-        calibrated_affinity = min(1.0, affinity * 1.4)
-        score = min(1.0, 0.58 * calibrated_semantic + 0.22 * lexical + 0.20 * calibrated_affinity)
+        score = metadata_match_score(
+            query,
+            query_vector,
+            skill,
+            provider,
+            candidate_tags,
+            affinity,
+        )
+        adjustment = rerank_feedback_adjustment(feedback, skill_id, policy)
+        if adjustment:
+            rerank_feedback_applied = True
+            score = max(0.0, min(1.0, score + adjustment))
         ranked.append((score, skill_id))
     ranked.sort(reverse=True)
     winner_score, winner_id = ranked[0]
@@ -453,12 +848,23 @@ def route(
         decision, selected, reason_codes = "none", None, ["ambiguous_top_candidates"]
     else:
         reason_codes = ["decisive_metadata_match"]
+    if query_tag_feedback_applied:
+        reason_codes.append("query_tag_feedback_applied")
+    if annotation_feedback_applied:
+        reason_codes.append("annotation_feedback_applied")
+    if rerank_feedback_applied:
+        reason_codes.append("rerank_feedback_applied")
     return {
         "decision": decision,
         "selected_skill_id": selected,
         "confidence": round(winner_score, 6),
         "winner_margin": round(margin, 6),
         "matched_tags": [tag_id for _, tag_id in retained_tags],
+        "feedback_tags": (
+            sorted(set(candidate_tags_by_skill[selected]) & set(tag_score_map))
+            if selected
+            else []
+        ),
         "candidate_skill_ids": [skill_id for _, skill_id in ranked],
         "reason_codes": reason_codes,
         "registry_version": registry_version,

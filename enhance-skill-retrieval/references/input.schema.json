@@ -4,10 +4,17 @@
   "type": "object",
   "required": ["operation"],
   "properties": {
-    "operation": {"enum": ["initialize_tags", "sync_tags", "set_tags", "reclassify_tags", "inspect_tags", "route"]},
+    "operation": {"enum": ["initialize_tags", "sync_tags", "set_tags", "reclassify_tags", "inspect_tags", "route", "request_feedback", "record_feedback", "feedback_status", "benchmark"]},
     "registry_version": {"type": "string"},
     "activation_threshold": {"type": "integer", "minimum": 1},
     "query": {"type": "string"},
+    "interaction_id": {"type": "string"},
+    "skill_id": {"type": "string"},
+    "feedback_tags": {"type": "array", "items": {"type": "string"}},
+    "rating": {"enum": ["accurate", "inaccurate"]},
+    "expected_skill_id": {"type": "string"},
+    "expected_tags": {"type": "array", "items": {"type": "string"}},
+    "expected_none": {"type": "boolean"},
     "skills": {"type": "array", "items": {"$ref": "#/$defs/skill"}}
   },
   "$defs": {

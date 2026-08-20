@@ -7,12 +7,16 @@ import argparse
 from typing import Any, Dict
 
 from retrieval_core import (
+    feedback_path,
     initialize_state,
+    load_feedback_state,
     load_resources,
     load_state,
     mutate_tags,
     read_json,
     reclassify_record,
+    remove_skill_feedback,
+    save_feedback_state,
     save_state,
     sync_state,
     write_json,
@@ -51,6 +55,10 @@ def main() -> int:
         state = load_state(args.state_dir)
         event = sync_state(state, payload, taxonomy, provider)
         save_state(args.state_dir, state)
+        if event == "skill_removed" and feedback_path(args.state_dir).exists():
+            feedback = load_feedback_state(args.state_dir)
+            remove_skill_feedback(feedback, payload["skill_id"])
+            save_feedback_state(args.state_dir, feedback)
         output = {"status": "synchronized", "event": event, "skill_count": len(state["skills"])}
     elif args.command in ("add", "remove", "lock", "unlock"):
         state = load_state(args.state_dir)

@@ -31,6 +31,21 @@ enhance-skill status
 enhance-skill list-tags
 enhance-skill show-tags lark-calendar
 enhance-skill lock-tags lark-calendar productivity.calendar
+enhance-skill feedback-status
 ```
 
 顶级命令 `enhance-skill` 已检查未与当前环境中的命令重复。完整子命令以 `enhance-skill --help` 为准。
+
+## 性能与反馈
+
+对比标签增强检索与全量元数据检索：
+
+```bash
+python3 enhance-skill-retrieval/scripts/benchmark_retrieval.py \
+  --catalog tests/fixtures/catalog.json \
+  --cases tests/performance-cases.jsonl \
+  --synthetic-size 500 \
+  --iterations 20
+```
+
+任务成功完成后，harness 可调用 `enhance-skill request-feedback` 进行默认 10% 抽样，再使用同一 interaction ID 调用 `record-feedback`。负反馈必须提供正确 Skill 与需求标签，系统分别判断查询标签错误、Skill 标签标注错误、候选漏召回和精排错误，并进入独立修正通道。系统不保存原始查询，累计至少 5 次同类反馈后才生效。

@@ -46,9 +46,32 @@ enhance-skill remove-tags <skill-id> <tag>...
 enhance-skill lock-tags <skill-id> <tag>...
 enhance-skill unlock-tags <skill-id> <tag>...
 enhance-skill reclassify-tags <skill-id> --input <skill.json>
+enhance-skill request-feedback --interaction-id <id> --route-result <result.json> --query <query>
+enhance-skill record-feedback --interaction-id <id> --rating accurate
+enhance-skill record-feedback --interaction-id <id> --rating inaccurate --expected-skill-id <id> --expected-tags <tag>...
+enhance-skill record-feedback --interaction-id <id> --rating inaccurate --expected-none
+enhance-skill feedback-status [skill-id]
 ```
 
 Pass `--json` before the subcommand for structured output. Manual tags override generated tags. Locked tags survive metadata updates. `unlock-tags` retains the tag as manual; use `remove-tags` to delete the manual assignment.
+
+### Benchmark retrieval
+
+Compare tag-enhanced retrieval with full-catalog metadata matching:
+
+```text
+python3 scripts/benchmark_retrieval.py \
+  --catalog <catalog.json> \
+  --cases <cases.jsonl> \
+  --synthetic-size 500 \
+  --iterations 20
+```
+
+The report includes query throughput, mean/P50/P95 latency, expected accuracy, result agreement, and P95 speedup. Treat timing as a benchmark report, not a unit-test pass condition.
+
+### Collect feedback
+
+After an invoked Skill completes successfully, call `request-feedback` with the route result and query. Ask the returned question only when sampled. A negative answer must identify the correct Skill and intended controlled tags, or state that no Skill was needed. Follow [feedback-protocol.md](feedback-protocol.md); never collect feedback before task completion or persist the raw conversation.
 
 ### Route
 
@@ -67,4 +90,4 @@ The router returns `invoke`, `none`, `bypass`, or `error`. `invoke` contains exa
 
 ## State ownership
 
-The harness owns Skill metadata and enabled state. The enhancer owns only manual/native/generated tag assignments. Derived vectors may be deleted and rebuilt at any time.
+The harness owns Skill metadata and enabled state. The enhancer owns manual/native/generated tag assignments and aggregate accuracy counters. Derived vectors may be deleted and rebuilt at any time.

@@ -1,4 +1,4 @@
 interface:
   display_name: "Skill Retrieval Enhancer"
   short_description: "Manage skill tags and accelerate large-catalog retrieval"
-  default_prompt: "Use $enhance-skill-retrieval to inspect or edit Skill tags with enhance-skill, synchronize the tag library, or route a query across a large Skill catalog."
+  default_prompt: "Use $enhance-skill-retrieval to inspect or edit Skill tags, benchmark retrieval, collect optional post-task accuracy feedback, or route a query across a large Skill catalog."
