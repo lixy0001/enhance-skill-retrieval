@@ -5,7 +5,16 @@ from __future__ import annotations
 
 import argparse
 
-from retrieval_core import load_feedback_state, load_resources, load_state, read_json, route, write_json
+from index_store import load_vector_cache
+from retrieval_core import (
+    load_feedback_state,
+    load_resources,
+    load_state,
+    read_json,
+    recall_candidates,
+    rerank_candidates,
+    write_json,
+)
 
 
 def main() -> int:
@@ -16,13 +25,21 @@ def main() -> int:
     try:
         payload = read_json(args.input)
         taxonomy, policy, provider = load_resources()
-        threshold = int(payload.get("activation_threshold", policy["activation_threshold"]))
-        if isinstance(payload.get("skills"), list) and len(payload["skills"]) <= threshold:
-            state = {"skills": {}}
-        else:
-            state = load_state(args.state_dir)
+        allowed = {"query", "registry_version", "enabled_skill_ids"}
+        if "candidate_skills" in payload:
+            allowed.add("candidate_skills")
+        unexpected = sorted(set(payload) - allowed)
+        if unexpected:
+            raise ValueError(
+                "ordinary routing accepts only query, registry_version, "
+                "enabled_skill_ids, and second-stage candidate_skills; unexpected: "
+                + ", ".join(unexpected)
+            )
+        state = load_state(args.state_dir)
+        vector_cache = load_vector_cache(args.state_dir, state, taxonomy, provider, required=True)
         feedback = load_feedback_state(args.state_dir)
-        result = route(payload, state, taxonomy, policy, provider, feedback)
+        router = rerank_candidates if "candidate_skills" in payload else recall_candidates
+        result = router(payload, state, taxonomy, policy, provider, feedback, vector_cache)
     except Exception as error:
         result = {
             "decision": "error",

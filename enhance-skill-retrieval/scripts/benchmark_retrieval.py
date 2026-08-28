@@ -9,6 +9,7 @@ import statistics
 import time
 from typing import Any, Callable, Dict, Iterable, Mapping, Sequence
 
+from index_store import build_vector_cache
 from retrieval_core import (
     cosine,
     initialize_state,
@@ -185,6 +186,7 @@ def main() -> int:
         taxonomy,
         provider,
     )
+    vector_cache = build_vector_cache(skills, state, taxonomy, provider)
     payloads = [
         {
             "query": case["prompt"],
@@ -195,7 +197,9 @@ def main() -> int:
         for case in cases
     ]
     enhanced_metrics, enhanced_results = measure(
-        lambda payload: route(payload, state, taxonomy, policy, provider),
+        lambda payload: route(
+            payload, state, taxonomy, policy, provider, vector_cache=vector_cache
+        ),
         payloads,
         args.iterations,
         args.warmup,

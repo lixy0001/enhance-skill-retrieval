@@ -9,6 +9,7 @@ import os
 import sys
 from typing import Any, Dict, Mapping
 
+from index_store import load_vector_cache, save_vector_cache, update_vector_cache
 from retrieval_core import (
     load_feedback_state,
     load_resources,
@@ -299,8 +300,19 @@ def main() -> int:
             skill = read_json(args.input)
             if skill.get("skill_id") != args.skill_id:
                 raise ValueError("input requires a matching Skill object")
+            cache = load_vector_cache(state_dir, state, taxonomy, provider, required=True)
             record = reclassify_record(state, skill, taxonomy, provider)
             save_state(state_dir, state)
+            save_vector_cache(
+                state_dir,
+                update_vector_cache(
+                    cache,
+                    {"event": "skill_updated", "skill": skill},
+                    state,
+                    taxonomy,
+                    provider,
+                ),
+            )
             output = {"kind": "updated", "status": "reclassified", "skill_id": args.skill_id, "record": record}
         elif args.command == "record-feedback":
             if args.rating == "accurate" and (

@@ -16,6 +16,7 @@ CLI = SCRIPTS / "enhance-skill"
 sys.path.insert(0, str(SCRIPTS))
 
 from retrieval_core import (  # noqa: E402
+    catalog_digest,
     candidate_effective_tags,
     corrected_tag_scores,
     feedback_adjustment,
@@ -23,15 +24,26 @@ from retrieval_core import (  # noqa: E402
     load_feedback_state,
     load_resources,
     load_state,
+    metadata_match_score,
     mutate_tags,
     record_feedback,
     record_pending_feedback,
+    recall_candidates,
     register_feedback_request,
+    rerank_candidates,
     route,
     save_feedback_state,
     save_state,
     should_request_feedback,
     sync_state,
+)
+from index_store import (  # noqa: E402
+    build_vector_cache,
+    ensure_vector_cache,
+    load_vector_cache,
+    save_vector_cache,
+    update_vector_cache,
+    vector_cache_path,
 )
 
 
@@ -84,12 +96,88 @@ class RetrievalTests(unittest.TestCase):
 
     def test_initialize_and_round_trip_state(self):
         self.assertEqual(85, len(self.state["skills"]))
+        self.assertEqual(catalog_digest(self.skills), self.state["catalog_digest"])
+        self.assertIn("pdf", self.state["tag_index"]["content.pdf"])
         with tempfile.TemporaryDirectory() as directory:
             save_state(directory, self.state)
             loaded = load_state(directory)
             self.assertEqual(self.state, loaded)
             with open(Path(directory) / "skill-tags.yaml", "r", encoding="utf-8") as handle:
-                self.assertEqual("1.0.0", json.load(handle)["schema_version"])
+                self.assertEqual("1.1.0", json.load(handle)["schema_version"])
+
+    def test_version_one_tag_state_migrates_derived_index(self):
+        legacy = json.loads(json.dumps(self.state))
+        legacy["schema_version"] = "1.0.0"
+        legacy.pop("index_version")
+        legacy.pop("catalog_digest")
+        legacy.pop("tag_index")
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "skill-tags.yaml").write_text(json.dumps(legacy))
+            migrated = load_state(directory)
+            self.assertEqual("1.1.0", migrated["schema_version"])
+            self.assertEqual(catalog_digest(self.skills), migrated["catalog_digest"])
+            self.assertIn("pdf", migrated["tag_index"]["content.pdf"])
+
+    def test_current_state_rejects_stale_derived_index(self):
+        stale = json.loads(json.dumps(self.state))
+        stale["tag_index"]["content.pdf"] = []
+        with tempfile.TemporaryDirectory() as directory:
+            save_state(directory, stale)
+            with self.assertRaisesRegex(ValueError, "tag index differs"):
+                load_state(directory)
+
+    def test_initialize_command_is_idempotent_and_requires_explicit_rebuild(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "catalog.json"
+            input_path.write_text(json.dumps(self.payload))
+            first = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "manage_tags.py"),
+                    "--state-dir",
+                    directory,
+                    "--input",
+                    str(input_path),
+                    "initialize",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            second = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "manage_tags.py"),
+                    "--state-dir",
+                    directory,
+                    "--input",
+                    str(input_path),
+                    "initialize",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual("initialized", json.loads(first.stdout)["status"])
+            self.assertEqual("already_initialized", json.loads(second.stdout)["status"])
+
+            changed = {"registry_version": "v2", "skills": self.skills[:-1]}
+            input_path.write_text(json.dumps(changed))
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "manage_tags.py"),
+                    "--state-dir",
+                    directory,
+                    "--input",
+                    str(input_path),
+                    "initialize",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(2, rejected.returncode)
+            self.assertIn("rebuild required", rejected.stderr)
 
     def test_manual_locked_tag_survives_update(self):
         mutate_tags(self.state, "pdf", "lock", ["content.documents"])
@@ -105,8 +193,117 @@ class RetrievalTests(unittest.TestCase):
         self.assertIn("content.documents", record["manual_tags"])
         self.assertIn("content.documents", record["locked_tags"])
         self.assertIn("content.documents", record["effective_tags"])
+        self.assertIn("pdf", self.state["tag_index"]["content.documents"])
+
+    def test_rebuild_preserves_manual_and_locked_tags(self):
+        mutate_tags(self.state, "pdf", "lock", ["content.documents"])
+        rebuilt = initialize_state(
+            self.payload,
+            self.taxonomy,
+            self.provider,
+            previous_state=self.state,
+        )
+        self.assertIn("content.documents", rebuilt["skills"]["pdf"]["manual_tags"])
+        self.assertIn("content.documents", rebuilt["skills"]["pdf"]["locked_tags"])
+        self.assertIn("pdf", rebuilt["tag_index"]["content.documents"])
+
+    def test_rebuild_command_preserves_manual_and_locked_tags(self):
+        mutate_tags(self.state, "pdf", "lock", ["content.documents"])
+        with tempfile.TemporaryDirectory() as directory:
+            save_state(directory, self.state)
+            input_path = Path(directory) / "catalog.json"
+            input_path.write_text(json.dumps(self.payload))
+            rebuilt = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "manage_tags.py"),
+                    "--state-dir",
+                    directory,
+                    "--input",
+                    str(input_path),
+                    "rebuild",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual("rebuilt", json.loads(rebuilt.stdout)["status"])
+            state = load_state(directory)
+            self.assertIn("content.documents", state["skills"]["pdf"]["manual_tags"])
+            self.assertIn("content.documents", state["skills"]["pdf"]["locked_tags"])
+            self.assertTrue(vector_cache_path(directory).exists())
+
+    def test_rebuild_prunes_feedback_for_removed_skills(self):
+        with tempfile.TemporaryDirectory() as directory:
+            save_state(directory, self.state)
+            save_feedback_state(
+                directory,
+                {
+                    "schema_version": "1.1.0",
+                    "total_responses": 1,
+                    "skills": {"pdf": {"positive": 1, "negative": 0}},
+                    "tag_skill": {
+                        "content.pdf": {"pdf": {"positive": 1, "negative": 0}}
+                    },
+                    "rerank_skills": {"pdf": {"positive": 1, "negative": 0}},
+                    "annotation_suggestions": {"pdf": {"content.documents": 5}},
+                    "pending": {},
+                },
+            )
+            input_path = Path(directory) / "catalog.json"
+            remaining = [skill for skill in self.skills if skill["skill_id"] != "pdf"]
+            input_path.write_text(json.dumps({"registry_version": "v2", "skills": remaining}))
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "manage_tags.py"),
+                    "--state-dir",
+                    directory,
+                    "--input",
+                    str(input_path),
+                    "rebuild",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            feedback = load_feedback_state(directory)
+            self.assertNotIn("pdf", feedback["skills"])
+            self.assertNotIn("content.pdf", feedback["tag_skill"])
+            self.assertNotIn("pdf", feedback["rerank_skills"])
+            self.assertNotIn("pdf", feedback["annotation_suggestions"])
+
+            save_feedback_state(
+                directory,
+                {
+                    "schema_version": "1.1.0",
+                    "total_responses": 1,
+                    "skills": {"pdf": {"positive": 1, "negative": 0}},
+                    "tag_skill": {},
+                    "rerank_skills": {},
+                    "annotation_suggestions": {},
+                    "pending": {},
+                },
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "manage_tags.py"),
+                    "--state-dir",
+                    directory,
+                    "--input",
+                    str(input_path),
+                    "rebuild",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotIn("pdf", load_feedback_state(directory)["skills"])
 
     def test_added_and_removed_events(self):
+        original_digest = self.state["catalog_digest"]
         skill = {
             "skill_id": "new-audio",
             "name": "new-audio",
@@ -120,6 +317,8 @@ class RetrievalTests(unittest.TestCase):
             self.provider,
         )
         self.assertIn("new-audio", self.state["skills"])
+        self.assertIn("new-audio", self.state["tag_index"]["media.audio"])
+        self.assertNotEqual(original_digest, self.state["catalog_digest"])
         sync_state(
             self.state,
             {"event": "skill_removed", "registry_version": "v3", "skill_id": "new-audio"},
@@ -127,6 +326,127 @@ class RetrievalTests(unittest.TestCase):
             self.provider,
         )
         self.assertNotIn("new-audio", self.state["skills"])
+        self.assertNotIn("new-audio", self.state.get("tag_index", {}).get("media.audio", []))
+        self.assertEqual(original_digest, self.state["catalog_digest"])
+
+    def test_vector_cache_can_be_deleted_and_rebuilt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = build_vector_cache(self.skills, self.state, self.taxonomy, self.provider)
+            save_vector_cache(directory, cache)
+            loaded = load_vector_cache(directory, self.state, self.taxonomy, self.provider)
+            self.assertEqual(self.state["catalog_digest"], loaded["catalog_digest"])
+            self.assertIn("content.pdf", loaded["tag_vectors"])
+            self.assertIn("pdf", loaded["skill_vectors"])
+
+            vector_cache_path(directory).unlink()
+            rebuilt, changed = ensure_vector_cache(
+                directory,
+                self.skills,
+                self.state,
+                self.taxonomy,
+                self.provider,
+            )
+            self.assertTrue(changed)
+            self.assertTrue(vector_cache_path(directory).exists())
+            self.assertEqual(
+                self.state["skills"]["pdf"]["metadata_fingerprint"],
+                rebuilt["skill_vectors"]["pdf"]["metadata_fingerprint"],
+            )
+
+            vector_cache_path(directory).write_text("not json", encoding="utf-8")
+            rebuilt, changed = ensure_vector_cache(
+                directory,
+                self.skills,
+                self.state,
+                self.taxonomy,
+                self.provider,
+            )
+            self.assertTrue(changed)
+            self.assertIn("pdf", rebuilt["skill_vectors"])
+
+    def test_vector_cache_rejects_missing_skill_vector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = build_vector_cache(self.skills, self.state, self.taxonomy, self.provider)
+            del cache["skill_vectors"]["pdf"]
+            save_vector_cache(directory, cache)
+            with self.assertRaisesRegex(ValueError, "stale"):
+                load_vector_cache(
+                    directory,
+                    self.state,
+                    self.taxonomy,
+                    self.provider,
+                    required=True,
+                )
+
+    def test_vector_cache_rejects_non_numeric_and_non_finite_vectors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = build_vector_cache(self.skills, self.state, self.taxonomy, self.provider)
+            cache["tag_vectors"]["content.pdf"] = ["bad"] * self.provider.dimensions
+            save_vector_cache(directory, cache)
+            with self.assertRaisesRegex(ValueError, "stale"):
+                load_vector_cache(
+                    directory,
+                    self.state,
+                    self.taxonomy,
+                    self.provider,
+                    required=True,
+                )
+
+            cache = build_vector_cache(self.skills, self.state, self.taxonomy, self.provider)
+            cache["skill_vectors"]["pdf"]["vector"][0] = float("nan")
+            save_vector_cache(directory, cache)
+            with self.assertRaisesRegex(ValueError, "stale"):
+                load_vector_cache(
+                    directory,
+                    self.state,
+                    self.taxonomy,
+                    self.provider,
+                    required=True,
+                )
+
+    def test_vector_cache_updates_incrementally_for_lifecycle_events(self):
+        cache = build_vector_cache(self.skills, self.state, self.taxonomy, self.provider)
+        added = {
+            "skill_id": "new-audio",
+            "name": "new-audio",
+            "description": "Clean background noise from audio recordings.",
+            "tags": ["media.audio"],
+        }
+        event = {"event": "skill_added", "registry_version": "v2", "skill": added}
+        sync_state(self.state, event, self.taxonomy, self.provider)
+        cache = update_vector_cache(cache, event, self.state, self.taxonomy, self.provider)
+        self.assertIn("new-audio", cache["skill_vectors"])
+        self.assertEqual(self.state["catalog_digest"], cache["catalog_digest"])
+
+        event = {"event": "skill_removed", "registry_version": "v3", "skill_id": "new-audio"}
+        sync_state(self.state, event, self.taxonomy, self.provider)
+        cache = update_vector_cache(cache, event, self.state, self.taxonomy, self.provider)
+        self.assertNotIn("new-audio", cache["skill_vectors"])
+        self.assertEqual(self.state["catalog_digest"], cache["catalog_digest"])
+
+    def test_cached_and_uncached_metadata_scoring_match(self):
+        skill = self.skills[0]
+        query = "Book a meeting room and update the calendar"
+        query_vector = self.provider.embed(query)
+        cache = build_vector_cache(self.skills, self.state, self.taxonomy, self.provider)
+        uncached = metadata_match_score(
+            query,
+            query_vector,
+            skill,
+            self.provider,
+            self.state["skills"][skill["skill_id"]]["effective_tags"],
+            0.75,
+        )
+        cached = metadata_match_score(
+            query,
+            query_vector,
+            skill,
+            self.provider,
+            self.state["skills"][skill["skill_id"]]["effective_tags"],
+            0.75,
+            cache["skill_vectors"][skill["skill_id"]]["vector"],
+        )
+        self.assertEqual(uncached, cached)
 
     def test_bypass_below_threshold(self):
         result = route(
@@ -138,6 +458,20 @@ class RetrievalTests(unittest.TestCase):
         )
         self.assertEqual("bypass", result["decision"])
 
+    def test_small_catalog_checks_enabled_ids_before_bypass(self):
+        with self.assertRaisesRegex(ValueError, "out of sync"):
+            recall_candidates(
+                {
+                    "query": "general request",
+                    "registry_version": "v1",
+                    "enabled_skill_ids": ["lark-calendar", "missing"],
+                },
+                self.state,
+                self.taxonomy,
+                self.policy,
+                self.provider,
+            )
+
     def test_explicit_skill_name(self):
         result = route(
             {"query": "Use git-submit-push now", "registry_version": "v1", "activation_threshold": 80, "skills": self.skills},
@@ -148,6 +482,39 @@ class RetrievalTests(unittest.TestCase):
         )
         self.assertEqual("invoke", result["decision"])
         self.assertEqual("git-submit-push", result["selected_skill_id"])
+
+    def test_explicit_skill_id_does_not_match_prefix(self):
+        skills = self.skills + [
+            {
+                "skill_id": "skill-1",
+                "name": "skill-1",
+                "description": "First numbered Skill.",
+                "tags": ["development.apps"],
+            },
+            {
+                "skill_id": "skill-10",
+                "name": "skill-10",
+                "description": "Tenth numbered Skill.",
+                "tags": ["development.apps"],
+            },
+        ]
+        state = initialize_state(
+            {"registry_version": "prefix", "skills": skills},
+            self.taxonomy,
+            self.provider,
+        )
+        result = recall_candidates(
+            {
+                "query": "Use skill-10 for this request",
+                "registry_version": "prefix",
+                "enabled_skill_ids": [skill["skill_id"] for skill in skills],
+            },
+            state,
+            self.taxonomy,
+            self.policy,
+            self.provider,
+        )
+        self.assertEqual(["skill-10"], result["candidate_skill_ids"])
 
     def test_tag_then_metadata_route(self):
         result = route(
@@ -161,11 +528,121 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual("lark-calendar", result["selected_skill_id"])
         self.assertEqual(["productivity.calendar"], result["feedback_tags"])
 
+    def test_route_command_uses_id_only_recall_then_candidate_metadata_rerank(self):
+        with tempfile.TemporaryDirectory() as directory:
+            save_state(directory, self.state)
+            save_vector_cache(
+                directory,
+                build_vector_cache(self.skills, self.state, self.taxonomy, self.provider),
+            )
+            route_input = Path(directory) / "route.json"
+            recall_payload = {
+                "query": "预订明天下午的会议室并更新日历日程",
+                "registry_version": "v1",
+                "enabled_skill_ids": [skill["skill_id"] for skill in self.skills],
+            }
+            route_input.write_text(json.dumps(recall_payload))
+            recalled = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "route_query.py"),
+                    "--state-dir",
+                    directory,
+                    "--input",
+                    str(route_input),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            recall_result = json.loads(recalled.stdout)
+            self.assertEqual("candidates", recall_result["decision"])
+            self.assertIn("lark-calendar", recall_result["candidate_skill_ids"])
+
+            wanted = set(recall_result["candidate_skill_ids"])
+            route_input.write_text(
+                json.dumps(
+                    {
+                        **recall_payload,
+                        "candidate_skills": [
+                            skill for skill in self.skills if skill["skill_id"] in wanted
+                        ],
+                    }
+                )
+            )
+            reranked = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "route_query.py"),
+                    "--state-dir",
+                    directory,
+                    "--input",
+                    str(route_input),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual("lark-calendar", json.loads(reranked.stdout)["selected_skill_id"])
+
+            route_input.write_text(json.dumps({**recall_payload, "skills": self.skills}))
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "route_query.py"),
+                    "--state-dir",
+                    directory,
+                    "--input",
+                    str(route_input),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(2, rejected.returncode)
+            self.assertIn("ordinary routing accepts only", rejected.stdout)
+
+    def test_rerank_requires_exact_recalled_candidate_metadata_set(self):
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            rerank_candidates(
+                {
+                    "query": "预订明天下午的会议室并更新日历日程",
+                    "registry_version": "v1",
+                    "enabled_skill_ids": [skill["skill_id"] for skill in self.skills],
+                    "candidate_skills": [],
+                },
+                self.state,
+                self.taxonomy,
+                self.policy,
+                self.provider,
+            )
+
     def test_out_of_sync_catalog_fails(self):
-        changed = list(self.skills) + [{"skill_id": "missing", "name": "missing", "description": "Missing tag record"}]
         with self.assertRaisesRegex(ValueError, "out of sync"):
-            route(
-                {"query": "missing", "registry_version": "v2", "activation_threshold": 80, "skills": changed},
+            recall_candidates(
+                {
+                    "query": "missing",
+                    "registry_version": "v1",
+                    "activation_threshold": 80,
+                    "enabled_skill_ids": [skill["skill_id"] for skill in self.skills] + ["missing"],
+                },
+                self.state,
+                self.taxonomy,
+                self.policy,
+                self.provider,
+            )
+
+    def test_changed_candidate_metadata_requires_sync(self):
+        changed_pdf = dict(self.skills[2])
+        changed_pdf["description"] = "Changed without a harness update event"
+        with self.assertRaisesRegex(ValueError, "candidate metadata differs"):
+            rerank_candidates(
+                {
+                    "query": "Use pdf now",
+                    "registry_version": "v1",
+                    "activation_threshold": 80,
+                    "enabled_skill_ids": [skill["skill_id"] for skill in self.skills],
+                    "candidate_skills": [changed_pdf],
+                },
                 self.state,
                 self.taxonomy,
                 self.policy,
@@ -205,6 +682,35 @@ class RetrievalTests(unittest.TestCase):
 
             matches = self.run_cli(directory, "skills-by-tag", "content.documents")
             self.assertEqual(["pdf"], matches["skills"])
+
+    def test_stable_cli_reclassify_updates_vector_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            save_state(directory, self.state)
+            save_vector_cache(
+                directory,
+                build_vector_cache(self.skills, self.state, self.taxonomy, self.provider),
+            )
+            changed = dict(self.skills[2])
+            changed["description"] = "Read, render, edit, and compare PDF documents."
+            input_path = Path(directory) / "pdf.json"
+            input_path.write_text(json.dumps(changed))
+
+            result = self.run_cli(
+                directory,
+                "reclassify-tags",
+                "pdf",
+                "--input",
+                str(input_path),
+            )
+            self.assertEqual("reclassified", result["status"])
+            state = load_state(directory)
+            cache = load_vector_cache(
+                directory, state, self.taxonomy, self.provider, required=True
+            )
+            self.assertEqual(
+                state["skills"]["pdf"]["metadata_fingerprint"],
+                cache["skill_vectors"]["pdf"]["metadata_fingerprint"],
+            )
 
     def test_stable_cli_reports_uninitialized_status(self):
         environment = dict(os.environ)
@@ -552,7 +1058,7 @@ class RetrievalTests(unittest.TestCase):
         routed = route(
             {
                 "query": "Edit this document",
-                "registry_version": "feedback",
+                "registry_version": "v1",
                 "activation_threshold": 80,
                 "skills": self.skills,
             },
@@ -628,6 +1134,10 @@ class RetrievalTests(unittest.TestCase):
     def test_harness_removal_prunes_skill_feedback(self):
         with tempfile.TemporaryDirectory() as directory:
             save_state(directory, self.state)
+            save_vector_cache(
+                directory,
+                build_vector_cache(self.skills, self.state, self.taxonomy, self.provider),
+            )
             feedback = {
                 "schema_version": "1.0.0",
                 "total_responses": 1,

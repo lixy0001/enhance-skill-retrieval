@@ -21,6 +21,10 @@ Pass a complete catalog snapshot to `manage_tags.py initialize`:
 }
 ```
 
+Call `initialize` when this enhancer is first attached to a harness state directory. It creates tag assignments, the tag-to-Skill inverted index, and tag/metadata vectors. Repeating it with the same catalog and taxonomy returns `already_initialized`; it does not reclassify every Skill. A different snapshot is rejected with `rebuild required` so a missed lifecycle event cannot silently overwrite state.
+
+For explicit recovery or a taxonomy migration, pass the same complete snapshot shape to `manage_tags.py rebuild`. Rebuild preserves manual and locked tags for Skill IDs that still exist, recreates derived indexes, and replaces the vector cache.
+
 ### Synchronize
 
 Pass one normal harness event to `manage_tags.py sync`:
@@ -29,7 +33,7 @@ Pass one normal harness event to `manage_tags.py sync`:
 {"event":"skill_added","registry_version":"v2","skill":{"skill_id":"pdf","name":"pdf","description":"Read and edit PDF files."}}
 ```
 
-Supported events are `skill_added`, `skill_updated`, and `skill_removed`. A removal event requires `skill_id`. V1 does not watch files or reconcile out-of-band changes.
+Supported events are `skill_added`, `skill_updated`, and `skill_removed`. A removal event requires `skill_id`. Each event updates only the affected tag postings and Skill metadata vector. V1 does not watch files or reconcile out-of-band changes.
 
 ### Edit tags
 
@@ -75,19 +79,43 @@ After an invoked Skill completes successfully, call `request-feedback` with the 
 
 ### Route
 
-Pass the query and current harness catalog to `route_query.py`:
+Ordinary conversation routing is a two-stage handshake. First pass only the query,
+the current registry version, and enabled Skill IDs to `route_query.py`:
 
 ```json
 {
   "query": "Move tomorrow's meeting to 3 PM",
   "registry_version": "v2",
-  "activation_threshold": 80,
-  "skills": []
+  "enabled_skill_ids": ["lark-calendar", "lark-vc", "pdf"]
 }
 ```
 
-The router returns `invoke`, `none`, `bypass`, or `error`. `invoke` contains exactly one `selected_skill_id`.
+When enhanced routing is active, the router returns `decision: candidates` plus up
+to the configured candidate limit of Skill IDs. The harness loads metadata only for
+those IDs and calls the same script again:
+
+```json
+{
+  "query": "Move tomorrow's meeting to 3 PM",
+  "registry_version": "v2",
+  "enabled_skill_ids": ["lark-calendar", "lark-vc", "pdf"],
+  "candidate_skills": [
+    {
+      "skill_id": "lark-calendar",
+      "name": "lark-calendar",
+      "description": "Manage calendars, events, availability, and rooms.",
+      "tags": ["productivity.calendar"]
+    }
+  ]
+}
+```
+
+The second call recomputes recall, requires the candidate metadata IDs to exactly
+match the recalled IDs, validates metadata fingerprints, and then returns `invoke`
+or `none`. A small enabled set returns `bypass` on the first call. Version drift,
+unknown enabled IDs, full-catalog `skills` input, stale candidate metadata, and a
+missing vector cache fail closed with `error`.
 
 ## State ownership
 
-The harness owns Skill metadata and enabled state. The enhancer owns manual/native/generated tag assignments and aggregate accuracy counters. Derived vectors may be deleted and rebuilt at any time.
+The harness owns Skill metadata and enabled state. The enhancer owns manual/native/generated tag assignments, its derived tag-to-Skill index, and aggregate accuracy counters. Derived vectors are persisted for reuse and maintained by lifecycle events; repeat `initialize` with the identical full snapshot or use explicit `rebuild` to recover a missing or incompatible cache. Routing below the activation threshold still returns `bypass`; initialization and lifecycle maintenance continue regardless of catalog size.

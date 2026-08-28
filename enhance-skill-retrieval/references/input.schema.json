@@ -2,12 +2,25 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Skill retrieval enhancer request",
   "type": "object",
-  "required": ["operation"],
+  "oneOf": [
+    {
+      "required": ["query", "registry_version", "enabled_skill_ids"],
+      "propertyNames": {"enum": ["query", "registry_version", "enabled_skill_ids", "candidate_skills"]}
+    },
+    {
+      "required": ["operation"],
+      "properties": {
+        "operation": {"enum": ["initialize_tags", "rebuild_tags", "sync_tags", "set_tags", "reclassify_tags", "inspect_tags", "request_feedback", "record_feedback", "feedback_status", "benchmark"]}
+      }
+    }
+  ],
   "properties": {
-    "operation": {"enum": ["initialize_tags", "sync_tags", "set_tags", "reclassify_tags", "inspect_tags", "route", "request_feedback", "record_feedback", "feedback_status", "benchmark"]},
+    "operation": {"enum": ["initialize_tags", "rebuild_tags", "sync_tags", "set_tags", "reclassify_tags", "inspect_tags", "request_feedback", "record_feedback", "feedback_status", "benchmark"]},
     "registry_version": {"type": "string"},
     "activation_threshold": {"type": "integer", "minimum": 1},
     "query": {"type": "string"},
+    "enabled_skill_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "candidate_skills": {"type": "array", "items": {"$ref": "#/$defs/skill"}},
     "interaction_id": {"type": "string"},
     "skill_id": {"type": "string"},
     "feedback_tags": {"type": "array", "items": {"type": "string"}},

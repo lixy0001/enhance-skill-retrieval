@@ -9,10 +9,11 @@ Keep the harness registry as the source of truth for Skill metadata. Persist onl
 
 ## Choose an operation
 
-- Initialize a tag library from the harness's complete current catalog: run `scripts/manage_tags.py initialize`.
+- Initialize the tag library and derived vector cache once from the harness's complete current catalog: run `scripts/manage_tags.py initialize`. Repeating the same snapshot is a no-op.
+- Explicitly rebuild from a changed complete snapshot only for recovery, migration, or taxonomy changes: run `scripts/manage_tags.py rebuild`.
 - Apply a normal harness install, update, or removal event: run `scripts/manage_tags.py sync`.
 - Let users inspect and edit tags through the stable `enhance-skill` command in `scripts/enhance-skill`.
-- Route a user request when the harness catalog exceeds its activation threshold: run `scripts/route_query.py`.
+- Route a user request when the harness catalog exceeds its activation threshold: first call `scripts/route_query.py` with only `query`, `registry_version`, and `enabled_skill_ids`; after it returns candidate IDs, have the harness load only those Skill metadata records and call it again with `candidate_skills`.
 - Measure retrieval behavior against JSONL cases: run `scripts/evaluate_retrieval.py`.
 - Compare enhanced and full-metadata query rates: run `scripts/benchmark_retrieval.py`.
 
@@ -53,20 +54,22 @@ Add `--json` before the subcommand for structured output. Keep `manage_tags.py` 
 ## Preserve ownership boundaries
 
 1. Accept Skill IDs and metadata from the harness; do not discover or mutate installed Skills.
-2. Create the complete initial tag library once from the harness snapshot.
-3. After initialization, process only normal harness `skill_added`, `skill_updated`, and `skill_removed` events in v1.
-4. Preserve manual and locked tags when metadata changes.
-5. Return `bypass` for routing when the catalog does not exceed the configured threshold. Continue allowing tag maintenance below the threshold.
-6. Return one Skill only when it clears the score and winner-margin rules; otherwise return `none`.
-7. Fail closed with `error`; let the harness decide whether to use its native fallback.
+2. Create the complete initial tag library, tag-to-Skill index, and derived metadata/tag vectors once from the harness snapshot.
+3. Treat a second identical initialization as success without reclassification. Require explicit `rebuild` for a different full snapshot, preserving manual and locked tags for surviving Skill IDs.
+4. After initialization, process only normal harness `skill_added`, `skill_updated`, and `skill_removed` events in v1; update the affected tag postings and metadata vector incrementally.
+5. Preserve manual and locked tags when metadata changes.
+6. Return `bypass` for routing when the catalog does not exceed the configured threshold. Continue maintaining indexes below the threshold so later activation needs no full rebuild.
+7. Return one Skill only when it clears the score and winner-margin rules; otherwise return `none`.
+8. Fail closed with `error`; let the harness decide whether to use its native fallback.
+9. Never pass the complete Skill catalog during ordinary routing. Require the rerank metadata set to exactly match the freshly recalled candidate IDs and validate each metadata fingerprint.
 
 ## State directory
 
 Require a writable `state_dir` supplied by the harness. Store:
 
-- `skill-tags.yaml`: persistent tag assignments in JSON-compatible YAML.
+- `skill-tags.yaml`: persistent tag assignments plus the tag-to-Skill inverted index in JSON-compatible YAML.
 - `feedback-stats.json`: aggregate feedback, bounded pending hashes, derived correction vectors, and root-cause counters.
-- `vector-cache.json`: optional, disposable derived vectors.
+- `vector-cache.json`: persistent tag and Skill-metadata vectors maintained by initialization and lifecycle events; recover it by repeating `initialize` with the identical full snapshot or by explicit `rebuild`.
 
 Never place dynamic state in this installed Skill directory. Never store full `SKILL.md` bodies.
 

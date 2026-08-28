@@ -19,13 +19,14 @@ agent/harness 自身的 Skill 注册表始终是 Skill 元数据的唯一数据�
 2. 读取已有原生标签。
 3. 对缺少标签的 Skills，根据名称、描述和路由示例生成标签。
 4. 建立初始标签库和标签到 Skill ID 的映射。
-5. 如果 Skill 数量超过阈值，同时构建标签向量索引；否则只保存标签库。
+5. 同时构建可持久复用的标签向量与 Skill 元数据向量缓存。
+6. 相同完整快照再次初始化时直接复用；快照或标签体系变化时要求显式重建。
 
 ### 日常同步
 
-- 新增 Skill：自动添加标签记录。
-- 更新 Skill：重新计算自动标签，保留用户手工标签。
-- 删除 Skill：同步删除标签记录和相关向量缓存。
+- 新增 Skill：自动添加标签记录，并增量增加倒排项与元数据向量。
+- 更新 Skill：重新计算自动标签，保留用户手工标签，并只更新受影响索引项。
+- 删除 Skill：同步删除标签记录、倒排项和相关向量缓存。
 - 用户可以随时为指定 Skill 增加、删除或锁定标签。
 
 ### 对话检索
@@ -36,9 +37,10 @@ Skill 数量未超过阈值
 → harness 使用原有全量元数据匹配
 
 Skill 数量超过阈值
+→ harness 只传 query + registry_version + enabled_skill_ids
 → 对话匹配标签向量
 → 标签筛选候选 Skill ID
-→ 加载候选 Skill 元数据
+→ harness 只加载候选 Skill 元数据
 → 元数据向量精排
 → 返回一个 Skill 或 none
 ```
@@ -92,27 +94,20 @@ else:
 
 ## 5. Harness 输入协议
 
-harness 至少提供：
+harness 在普通对话的第一阶段只提供：
 
 ```json
 {
-  "operation": "route",
   "query": "把明天下午的会议改到三点",
-  "recent_context": [],
   "registry_version": "harness-defined-version",
-  "activation_threshold": 80,
-  "skills": [
-    {
-      "skill_id": "lark-calendar",
-      "name": "lark-calendar",
-      "description": "管理日历、日程、忙闲和会议室",
-      "tags": ["productivity.calendar"],
-      "aliases": ["日历", "日程", "会议室"],
-      "metadata_version": "harness-defined-version"
-    }
-  ]
+  "enabled_skill_ids": ["lark-calendar", "lark-vc", "pdf"]
 }
 ```
+
+标签召回返回候选 ID 后，harness 只加载候选 Skill 的元数据，并在第二阶段增加
+`candidate_skills` 字段。增强器重新计算候选集合，要求候选元数据与召回 ID 完全一致，
+校验元数据指纹后再精排。完整 Skill 快照只用于首次 `initialize_tags`、显式
+`rebuild_tags`，不进入普通对话路由。
 
 支持的操作：
 
@@ -224,14 +219,15 @@ Skill 是否存在、是否启用及其最新元数据始终由 harness 注册�
 3. 规范化原生标签并运行 agent 分类。
 4. 生成 `effective_tags`。
 5. 建立标签到 Skill ID 的倒排映射。
-6. 数量超过阈值时才生成标签向量。
+6. 生成标签向量与 Skill 元数据向量缓存，使以后超过阈值时无需全量构建。
+7. 对相同快照的重复初始化返回成功但不重新分类；不同快照必须显式执行重建。
 
 ### 新增 Skill
 
 1. 接收 harness 安装完成后产生的 `skill_added` 事件。
 2. 读取原生标签并生成 agent 标签。
 3. 添加标签记录。
-4. 标签检索已启用时，增量更新相关标签向量和映射。
+4. 增量更新相关倒排映射和元数据向量；是否启用标签检索不影响索引维护。
 
 ### 更新 Skill
 
@@ -268,8 +264,8 @@ candidate skill metadata vectors
 - 标签库是标签分配来源，harness 是 Skill 元数据来源；
 - 不缓存完整 `SKILL.md` 正文；
 - 使用注册表版本和元数据指纹判断失效；
-- 缓存缺失、损坏或版本不兼容时直接重建；
-- Skill 数量未超过阈值时无需构建标签向量；
+- 缓存缺失、损坏或版本不兼容时失败关闭，并通过完整快照显式重建；
+- Skill 数量未超过阈值时仍维护派生索引，但路由直接绕过标签检索；
 - 首版不引入独立数据库或常驻索引服务。
 
 ## 11. 大规模检索流程
@@ -363,7 +359,9 @@ on skill_registry_changed:
 
 on user_query:
     if skills.count > configured_threshold:
-        route(query, registry_version)
+        candidates = recall(query, registry_version, enabled_skill_ids)
+        metadata = registry.load_metadata(candidates.skill_ids)
+        rerank(query, registry_version, enabled_skill_ids, metadata)
     else:
         continue native routing
 ```
