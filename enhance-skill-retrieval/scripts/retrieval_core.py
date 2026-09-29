@@ -1098,27 +1098,20 @@ def rerank_candidates(
             "Harness must inject a Jev reranker for second-stage routing"
         )
     selector = jev_reranker
-    jev_result = selector.select(query, candidates)
-    winner_id = str(jev_result["winner"])
-    if winner_id not in catalog:
-        raise ValueError("Jev selected a Skill outside the recalled candidates")
-    probabilities = {
-        skill_id: float(jev_result["probabilities"][skill_id])
-        for skill_id in expected_ids
-    }
+    jev_result = selector.score(query, candidates)
     fits = {
         skill_id: float(jev_result["fits"][skill_id]) for skill_id in expected_ids
     }
-    ranked_ids = sorted(expected_ids, key=lambda skill_id: (-probabilities[skill_id], skill_id))
-    ranked_probabilities = [probabilities[skill_id] for skill_id in ranked_ids]
-    winner_probability = probabilities[winner_id]
-    runner_probability = ranked_probabilities[1] if len(ranked_probabilities) > 1 else 0.0
-    margin = winner_probability - runner_probability
+    ranked_ids = sorted(expected_ids, key=lambda skill_id: (-fits[skill_id], skill_id))
+    winner_id = ranked_ids[0]
+    winner_fit = fits[winner_id]
+    runner_fit = fits[ranked_ids[1]] if len(ranked_ids) > 1 else 0.0
+    margin = winner_fit - runner_fit
     minimum_fit = float(policy.get("jev_fit_threshold", 0.30))
-    if max(fits.values()) < minimum_fit:
+    if winner_fit < minimum_fit:
         decision, selected, reason_codes = "none", None, ["jev_no_candidate_fit"]
     else:
-        decision, selected, reason_codes = "invoke", winner_id, ["jev_choice"]
+        decision, selected, reason_codes = "invoke", winner_id, ["jev_fit"]
     reason_codes.extend(
         reason
         for reason in recall_result["reason_codes"]
@@ -1127,8 +1120,7 @@ def rerank_candidates(
     return {
         "decision": decision,
         "selected_skill_id": selected,
-        "confidence": round(float(jev_result["confidence"]), 6),
-        "winner_probability": round(winner_probability, 6),
+        "highest_fit_probability": round(winner_fit, 6),
         "winner_margin": round(margin, 6),
         "matched_tags": retained_tags,
         "feedback_tags": (
@@ -1140,9 +1132,6 @@ def rerank_candidates(
             else []
         ),
         "candidate_skill_ids": ranked_ids,
-        "candidate_choice_scores": {
-            skill_id: round(probabilities[skill_id], 6) for skill_id in ranked_ids
-        },
         "candidate_fit_scores": {
             skill_id: round(fits[skill_id], 6) for skill_id in ranked_ids
         },

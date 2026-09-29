@@ -111,10 +111,12 @@ those IDs and calls the same script again:
 
 The second call recomputes recall, requires the candidate metadata IDs to exactly
 match the recalled IDs, validates metadata fingerprints, and sends all candidates
-to TypeSafe Jev. A `Choice` answer selects the winner; one `Noul` answer per candidate
-provides an absolute fit gate that can return `none`. Candidate options are sorted by
-Skill ID and carry no recall score or previous ordering. The result includes
-`candidate_choice_scores`, `candidate_fit_scores`, and `reranker_model` for diagnostics.
+to TypeSafe Jev. One `Noul` answer per candidate supplies an absolute fit probability.
+The harness sorts those probabilities, breaks equal fits by Skill ID, and returns
+`none` when the highest fit is below `jev_fit_threshold`; otherwise it selects the
+highest-fit Skill. Candidates carry no recall score or previous ordering. The result
+includes `highest_fit_probability`, `candidate_fit_scores`, and `reranker_model`
+for diagnostics.
 
 For an in-process integration, construct `JevReranker.from_policy(policy,
 api_key=secret)` and pass it as `jev_reranker`. For a subprocess integration, add
@@ -123,7 +125,7 @@ Keep the key out of routing JSON, environment variables, state, output, and logs
 The first-stage call needs no credential. A small enabled set returns `bypass` on
 the first call. Version drift, unknown enabled IDs, full-catalog `skills` input,
 stale candidate metadata, missing vector cache, missing Jev injection, service
-failure, malformed probabilities, and an out-of-set winner fail closed with `error`;
+failure, and missing, extra, or malformed fit probabilities fail closed with `error`;
 the harness owns fallback behavior.
 
 ## State ownership

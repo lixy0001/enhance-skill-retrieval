@@ -47,15 +47,15 @@ Add `--json` before the subcommand for structured output. Keep `manage_tags.py` 
 5. Hash and bound comparison IDs for idempotency. Store no raw comparison ID or query.
 6. Apply a correction only after 5 matching comparisons and keep all score movements capped. A single native-route error must not immediately change routing.
 
-## Use Jev for the final decision
+## Use Jev for fit scoring
 
 1. Keep the first stage deterministic and high-recall. Its tag and hash-vector scores produce candidate IDs only.
-2. Send every recalled candidate's name, description, aliases, and tags to Jev in one request. Sort options by Skill ID and omit recall scores and prior ordering.
-3. Use one `Choice` answer to select among candidates and one `Noul` answer per candidate to decide whether any candidate truly fits.
-4. Return `none` when every fit probability is below `jev_fit_threshold`. Otherwise return the `Choice` winner; expose Choice and fit probabilities as diagnostics, not accuracy claims.
-5. Validate that every returned probability is finite and bounded and that the winner belongs to the freshly recalled enabled set.
+2. Send every recalled candidate's Skill ID, description, aliases, and tags to Jev in one request. Sort candidates by Skill ID and omit recall scores and prior ordering.
+3. Ask one `Noul` question per candidate so Jev returns only the probability that each Skill directly supports the request.
+4. Let the harness sort candidates by fit probability, breaking equal fits by Skill ID. Return `none` when the highest fit is below `jev_fit_threshold`; otherwise return that highest-fit Skill.
+5. Validate that Jev returns exactly one finite, bounded fit probability for every freshly recalled candidate. Expose fit probabilities as diagnostics, not accuracy claims.
 6. Require the harness to construct and inject the Jev client with its TypeSafe API key. For subprocess integration, read the key only from the harness-owned path supplied by `--jev-api-key-file`; keep credentials out of routing JSON, environment variables, state, output, and logs.
-7. Fail closed with `error` on missing injection, timeout, service failure, malformed output, or an out-of-set winner. Let the harness choose its native fallback.
+7. Fail closed with `error` on missing injection, timeout, service failure, malformed output, or missing or extra candidate fits. Let the harness choose its native fallback.
 
 ## Preserve ownership boundaries
 
@@ -65,7 +65,7 @@ Add `--json` before the subcommand for structured output. Keep `manage_tags.py` 
 4. After initialization, process only normal harness `skill_added`, `skill_updated`, and `skill_removed` events in v1; update the affected tag postings and metadata vector incrementally.
 5. Preserve manual and locked tags when metadata changes.
 6. Return `bypass` for routing when the catalog does not exceed the configured threshold. Continue maintaining indexes below the threshold so later activation needs no full rebuild.
-7. Return one Skill only when Jev selects a recalled candidate and at least one candidate clears the calibrated fit gate; otherwise return `none`.
+7. Return the highest-fit recalled Skill only when its Jev probability clears the calibrated fit gate; otherwise return `none`.
 8. Fail closed with `error`; let the harness decide whether to use its native fallback.
 9. Never pass the complete Skill catalog during ordinary routing. Require the rerank metadata set to exactly match the freshly recalled candidate IDs and validate each metadata fingerprint.
 

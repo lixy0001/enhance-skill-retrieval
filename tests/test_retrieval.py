@@ -759,7 +759,7 @@ class RetrievalTests(unittest.TestCase):
         status = json.loads(result.stdout)
         self.assertFalse(status["initialized"])
 
-    def test_jev_choice_is_not_overridden_by_shadow_rerank_scores(self):
+    def test_harness_selects_highest_jev_fit(self):
         skills = catalog()
         skills[0] = {
             "skill_id": "calendar-a",
@@ -792,6 +792,14 @@ class RetrievalTests(unittest.TestCase):
                 "calendar-b": {"positive": 8, "negative": 0},
             },
         }
+
+        class FitsOnlyJevReranker:
+            def score(self, query, candidates):
+                return {
+                    "fits": {"calendar-a": 0.2, "calendar-b": 0.9},
+                    "model": "jev-test",
+                }
+
         result = route(
             payload,
             state,
@@ -799,11 +807,16 @@ class RetrievalTests(unittest.TestCase):
             self.policy,
             self.provider,
             feedback,
-            jev_reranker=FakeJevReranker("calendar-a"),
+            jev_reranker=FitsOnlyJevReranker(),
         )
         self.assertEqual("invoke", result["decision"])
-        self.assertEqual("calendar-a", result["selected_skill_id"])
-        self.assertEqual(["jev_choice"], result["reason_codes"])
+        self.assertEqual("calendar-b", result["selected_skill_id"])
+        self.assertEqual(["calendar-b", "calendar-a"], result["candidate_skill_ids"])
+        self.assertEqual({"calendar-b": 0.9, "calendar-a": 0.2}, result["candidate_fit_scores"])
+        self.assertEqual(0.9, result["highest_fit_probability"])
+        self.assertNotIn("candidate_choice_scores", result)
+        self.assertNotIn("confidence", result)
+        self.assertEqual(["jev_fit"], result["reason_codes"])
 
     def test_jev_fit_gate_can_reject_all_candidates(self):
         result = route(
@@ -823,33 +836,59 @@ class RetrievalTests(unittest.TestCase):
         self.assertIsNone(result["selected_skill_id"])
         self.assertEqual(["jev_no_candidate_fit"], result["reason_codes"])
 
+    def test_harness_breaks_equal_jev_fits_by_skill_id(self):
+        class EqualFitsJevReranker:
+            def score(self, query, candidates):
+                return {
+                    "fits": {skill["skill_id"]: 0.8 for skill in candidates},
+                    "model": "jev-test",
+                }
+
+        result = route(
+            {
+                "query": "预订明天下午的会议室并更新日历日程",
+                "registry_version": "v1",
+                "activation_threshold": 80,
+                "skills": self.skills,
+            },
+            self.state,
+            self.taxonomy,
+            self.policy,
+            self.provider,
+            jev_reranker=EqualFitsJevReranker(),
+        )
+        self.assertEqual("invoke", result["decision"])
+        self.assertEqual(["lark-calendar", "lark-vc"], result["candidate_skill_ids"])
+        self.assertEqual("lark-calendar", result["selected_skill_id"])
+
     def test_jev_request_hides_recall_order_and_scores(self):
         request = build_jev_request(
             "read this document",
             [self.skills[2], self.skills[0]],
             "jev-test",
         )
-        criteria = request["questions"]["which"]["criteria"]
-        self.assertEqual(["lark-calendar", "pdf"], list(criteria))
+        self.assertEqual(
+            ["fits::lark-calendar", "fits::pdf"],
+            list(request["questions"]),
+        )
+        self.assertEqual(
+            {"noul"},
+            {question["type"] for question in request["questions"].values()},
+        )
         self.assertNotIn("score", json.dumps(request).casefold())
 
-    def test_jev_response_rejects_skill_outside_candidate_set(self):
+    def test_jev_response_rejects_fit_outside_candidate_set(self):
         response = {
             "model": "jev-test",
             "answers": {
-                "which": {
-                    "type": "choice",
-                    "choice": "outside",
-                    "probabilities": {"pdf": 1.0},
-                    "confidence": 1.0,
-                },
                 "fits::pdf": {"type": "noul", "noul": 1.0},
+                "fits::outside": {"type": "noul", "noul": 0.5},
             },
         }
-        with self.assertRaisesRegex(JevRerankerError, "outside"):
+        with self.assertRaisesRegex(JevRerankerError, "do not match"):
             parse_jev_response(response, ["pdf"])
 
-    def test_jev_http_client_uses_typed_choice_and_fit_answers(self):
+    def test_jev_http_client_uses_only_typed_fit_answers(self):
         class Response:
             def __enter__(self):
                 return self
@@ -862,12 +901,6 @@ class RetrievalTests(unittest.TestCase):
                     {
                         "model": "jev-1.test",
                         "answers": {
-                            "which": {
-                                "type": "choice",
-                                "choice": "pdf",
-                                "probabilities": {"lark-calendar": 0.1, "pdf": 0.9},
-                                "confidence": 0.85,
-                            },
                             "fits::lark-calendar": {"type": "noul", "noul": 0.1},
                             "fits::pdf": {"type": "noul", "noul": 0.95},
                         },
@@ -882,12 +915,15 @@ class RetrievalTests(unittest.TestCase):
             max_attempts=1,
         )
         with patch("jev_reranker.urllib.request.urlopen", return_value=Response()) as mocked:
-            result = client.select("read a PDF", [self.skills[2], self.skills[0]])
-        self.assertEqual("pdf", result["winner"])
+            result = client.score("read a PDF", [self.skills[2], self.skills[0]])
+        self.assertEqual({"lark-calendar": 0.1, "pdf": 0.95}, result["fits"])
         request = mocked.call_args.args[0]
         payload = json.loads(request.data)
         self.assertEqual("jev-test", payload["model"])
-        self.assertEqual(["lark-calendar", "pdf"], list(payload["questions"]["which"]["criteria"]))
+        self.assertEqual(
+            ["fits::lark-calendar", "fits::pdf"],
+            list(payload["questions"]),
+        )
         self.assertEqual("Bearer secret", request.get_header("Authorization"))
 
     def test_jev_requires_harness_injected_api_key(self):

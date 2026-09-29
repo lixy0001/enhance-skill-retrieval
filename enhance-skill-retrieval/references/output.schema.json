@@ -10,15 +10,11 @@
     "decision": {"enum": ["candidates", "invoke", "none", "bypass", "error"]},
     "selected_skill_id": {"type": ["string", "null"]},
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-    "winner_probability": {"type": "number", "minimum": 0, "maximum": 1},
+    "highest_fit_probability": {"type": "number", "minimum": 0, "maximum": 1},
     "winner_margin": {"type": "number", "minimum": 0, "maximum": 1},
     "matched_tags": {"type": "array", "items": {"type": "string"}},
     "feedback_tags": {"type": "array", "items": {"type": "string"}},
     "candidate_skill_ids": {"type": "array", "items": {"type": "string"}},
-    "candidate_choice_scores": {
-      "type": "object",
-      "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}
-    },
     "candidate_fit_scores": {
       "type": "object",
       "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}
