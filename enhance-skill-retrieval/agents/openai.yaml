@@ -1,4 +1,4 @@
 interface:
   display_name: "Skill Retrieval Enhancer"
-  short_description: "Manage skill tags and accelerate large-catalog retrieval"
-  default_prompt: "Use $enhance-skill-retrieval to inspect or edit Skill tags, benchmark retrieval, collect optional post-task accuracy feedback, or route a query across a large Skill catalog."
+  short_description: "Manage tags and route large Skill catalogs with Jev"
+  default_prompt: "Use $enhance-skill-retrieval to inspect or edit Skill tags, benchmark retrieval, compare enhanced routing with the harness native route, or select a Skill through tag recall and TypeSafe Jev reranking."

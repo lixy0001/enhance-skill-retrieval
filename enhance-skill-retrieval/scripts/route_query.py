@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Route a query through tag recall and candidate metadata vector ranking."""
+"""Route a query through tag recall and TypeSafe Jev candidate selection."""
 
 from __future__ import annotations
 
 import argparse
 
 from index_store import load_vector_cache
+from jev_reranker import JevReranker, read_harness_api_key
 from retrieval_core import (
     load_feedback_state,
+    enabled_skill_ids_digest,
     load_resources,
     load_state,
     read_json,
@@ -21,6 +23,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--input", default="-", help="JSON input file; defaults to stdin")
+    parser.add_argument(
+        "--jev-api-key-file",
+        help=(
+            "Harness-owned secret file or inherited file descriptor path containing "
+            "the TypeSafe API key"
+        ),
+    )
     args = parser.parse_args()
     try:
         payload = read_json(args.input)
@@ -38,8 +47,30 @@ def main() -> int:
         state = load_state(args.state_dir)
         vector_cache = load_vector_cache(args.state_dir, state, taxonomy, provider, required=True)
         feedback = load_feedback_state(args.state_dir)
-        router = rerank_candidates if "candidate_skills" in payload else recall_candidates
-        result = router(payload, state, taxonomy, policy, provider, feedback, vector_cache)
+        if "candidate_skills" in payload:
+            jev_reranker = None
+            if args.jev_api_key_file:
+                jev_reranker = JevReranker.from_policy(
+                    policy,
+                    api_key=read_harness_api_key(args.jev_api_key_file),
+                )
+            result = rerank_candidates(
+                payload,
+                state,
+                taxonomy,
+                policy,
+                provider,
+                feedback,
+                vector_cache,
+                jev_reranker=jev_reranker,
+            )
+        else:
+            result = recall_candidates(
+                payload, state, taxonomy, policy, provider, feedback, vector_cache
+            )
+        result["enabled_skill_ids_digest"] = enabled_skill_ids_digest(
+            payload["enabled_skill_ids"]
+        )
     except Exception as error:
         result = {
             "decision": "error",

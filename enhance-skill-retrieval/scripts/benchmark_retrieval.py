@@ -10,6 +10,7 @@ import time
 from typing import Any, Callable, Dict, Iterable, Mapping, Sequence
 
 from index_store import build_vector_cache
+from jev_reranker import JevReranker, read_harness_api_key
 from retrieval_core import (
     cosine,
     initialize_state,
@@ -74,9 +75,9 @@ def full_metadata_route(
     winner_score, winner_id = ranked[0]
     runner_score = ranked[1][0] if len(ranked) > 1 else 0.0
     margin = winner_score - runner_score
-    if winner_score < float(policy["minimum_skill_score"]):
+    if winner_score < float(policy["benchmark_minimum_skill_score"]):
         decision, selected, reasons = "none", None, ["below_skill_threshold"]
-    elif margin < float(policy["minimum_winner_margin"]):
+    elif margin < float(policy["benchmark_minimum_winner_margin"]):
         decision, selected, reasons = "none", None, ["ambiguous_top_candidates"]
     else:
         decision, selected, reasons = "invoke", winner_id, ["full_metadata_match"]
@@ -172,6 +173,11 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--synthetic-size", type=int, default=0)
+    parser.add_argument(
+        "--jev-api-key-file",
+        required=True,
+        help="Harness-owned file containing the TypeSafe API key",
+    )
     args = parser.parse_args()
     if args.iterations < 1 or args.warmup < 0:
         raise ValueError("iterations must be positive and warmup must not be negative")
@@ -181,6 +187,10 @@ def main() -> int:
     cases = load_cases(args.cases)
     skills = expand_catalog(catalog["skills"], args.synthetic_size)
     taxonomy, policy, provider = load_resources()
+    jev_reranker = JevReranker.from_policy(
+        policy,
+        api_key=read_harness_api_key(args.jev_api_key_file),
+    )
     state = initialize_state(
         {"registry_version": catalog.get("registry_version", "benchmark"), "skills": skills},
         taxonomy,
@@ -198,7 +208,13 @@ def main() -> int:
     ]
     enhanced_metrics, enhanced_results = measure(
         lambda payload: route(
-            payload, state, taxonomy, policy, provider, vector_cache=vector_cache
+            payload,
+            state,
+            taxonomy,
+            policy,
+            provider,
+            vector_cache=vector_cache,
+            jev_reranker=jev_reranker,
         ),
         payloads,
         args.iterations,

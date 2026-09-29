@@ -1,80 +1,53 @@
-# Feedback Protocol
+# Automatic Shadow-Comparison Protocol
 
-## Request feedback after completion
+## Run two independent selectors
 
-Run feedback sampling only after a successful task whose route decision was `invoke`. Save the route result to JSON, then pass it with the completed-task query:
+For one query, the harness runs:
+
+1. the enhanced two-stage route;
+2. the harness native Skill selector with enhancement disabled.
+
+Both selectors must use the same `registry_version` and enabled Skill set. Each result carries the SHA-256 digest of the sorted enabled Skill IDs, and `compare-routing` rejects unequal digests. The native selector may return `invoke` with one Skill ID or `none`. Treat that result as a pseudo-label; do not ask the user to judge accuracy.
+
+The native selector stays outside the enhancer. It may use the harness registry internally, but the ordinary enhanced route still receives only `query + registry_version + enabled_skill_ids`, followed by candidate metadata for reranking.
+
+## Record one comparison
+
+Save the two final results and call:
 
 ```text
-enhance-skill --json request-feedback \
-  --interaction-id task-2026-0001 \
-  --route-result route-result.json \
+enhance-skill --json compare-routing \
+  --comparison-id task-2026-0001 \
+  --enhanced-result enhanced-result.json \
+  --baseline-result native-result.json \
   --query "查看昨天会议的逐字稿"
 ```
 
-The command validates the selected Skill and its `feedback_tags`, hashes the interaction ID, converts the query to a local derived vector, and applies the default 10% stable pseudorandom sample. Never ask after `none`, `bypass`, `error`, cancellation, or failed execution.
+Each result must contain `decision`, `selected_skill_id`, `registry_version`, and `enabled_skill_ids_digest`. Enhanced results also carry `matched_tags`, `feedback_tags`, and `candidate_skill_ids` when available.
 
-Do not persist the raw interaction ID or query. A sampled pending request contains only the interaction hash, selected Skill, matched tags, feedback tags, candidate IDs, and derived query vector. Cap pending requests with `feedback_pending_limit`.
+The comparison ID is stored only as a bounded hash for idempotency. The raw query is vectorized for correction learning and is not persisted. A repeated comparison ID is rejected.
 
-## Record accurate feedback
+## Attribute differences automatically
 
-```text
-enhance-skill record-feedback \
-  --interaction-id task-2026-0001 \
-  --rating accurate
-```
-
-Reinforce only the selected Skill and its final `feedback_tags`.
-
-## Record inaccurate feedback
-
-Ask which Skill should have been used and which controlled tags represent the user's intent:
-
-```text
-enhance-skill record-feedback \
-  --interaction-id task-2026-0001 \
-  --rating inaccurate \
-  --expected-skill-id lark-vc \
-  --expected-tags collaboration.meetings
-```
-
-If no Skill should have been invoked:
-
-```text
-enhance-skill record-feedback \
-  --interaction-id task-2026-0001 \
-  --rating inaccurate \
-  --expected-none
-```
-
-Reject negative feedback that omits both the expected Skill and intent tags. Consume each pending request once so repeated feedback fails.
-
-## Attribute the root cause
-
-Compare:
-
-- `matched_tags`: tags retrieved for the query;
-- `expected_tags`: user-confirmed intent tags;
-- the expected Skill's `effective_tags`;
-- `candidate_skill_ids`: Skills admitted to metadata ranking.
-
-Classify independently:
+When the native selector chooses a Skill, infer the most relevant controlled intent tag from that Skill's current `effective_tags`. Then classify:
 
 | Condition | Root cause | Correction channel |
 |---|---|---|
-| Expected tag absent from `matched_tags` | `query_tag_mismatch` | Similar-query tag correction prototype |
-| Expected tag absent from expected Skill's tags | `skill_tag_annotation_error` | Controlled virtual-tag suggestion |
-| Expected Skill absent from candidates | `candidate_recall_error` | First-stage tag-to-Skill adjustment |
-| Expected Skill present but not selected | `skill_rerank_error` | Metadata rerank adjustment |
-| No Skill should have run | `over_recall` | Matched-tag rejection adjustment |
+| Native intent tag absent from enhanced matched tags | `query_tag_mismatch` | Similar-query tag correction prototype |
+| Native Skill absent from enhanced candidates | `candidate_recall_error` | First-stage query/tag-to-Skill adjustment |
+| Native Skill present but enhanced route selects another Skill or `none` | `skill_rerank_error` | Metadata rerank adjustment |
+| Native selector returns `none` while enhanced route invokes | `over_recall` | Matched-tag rejection adjustment |
+| Both selectors choose the same Skill or both return `none` | `baseline_agreement` | Aggregate agreement; reinforce matching Skill/tag only |
 
-Multiple causes may apply to one response. Do not force a single cause when both query matching and Skill annotation are wrong.
+The baseline comparison alone cannot prove that a Skill needs a new persistent tag, so it does not rewrite manual/native/agent tags or create virtual annotation tags.
 
 ## Apply corrections conservatively
 
-- Query-tag mismatch: aggregate derived-vector centroids by wrong-tag to expected-tag pair. After `feedback_min_samples`, adjust only similar queries above `feedback_query_similarity` and cap tag-score movement with `feedback_tag_max_adjustment`.
-- Skill annotation error: count a controlled tag suggestion for the expected Skill. After `feedback_min_samples`, use it as a virtual candidate tag without rewriting the Skill's persisted manual/native/agent tags.
-- Rerank error: adjust final metadata ranking only when the expected Skill was already in the candidate set.
-- Over-recall: penalize repeatedly rejected matched tags after the minimum sample count.
-- Explicit Skill names always override learned feedback.
+- Treat the native result as a pseudo-label, not ground truth guaranteed by a user.
+- Require `feedback_min_samples` matching observations before any correction affects routing.
+- Apply query-tag corrections only to similar queries above `feedback_query_similarity`.
+- Cap query-tag and final score movements with the configured maximum adjustments.
+- Explicit Skill IDs override learned corrections.
+- Reject comparisons with stale registry versions, unequal enabled-set digests, unknown Skill IDs, uncontrolled matched tags, invalid decisions, or duplicate comparison IDs.
 
-Removing a Skill through the harness removes its Skill-level, rerank, annotation, and pending feedback state.
+Removing a Skill through the harness removes its Skill-level and rerank comparison statistics. Rebuild discards statistics for Skills no longer present.

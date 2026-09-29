@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,8 @@ from retrieval_core import (  # noqa: E402
     catalog_digest,
     candidate_effective_tags,
     corrected_tag_scores,
+    empty_feedback_state,
+    enabled_skill_ids_digest,
     feedback_adjustment,
     initialize_state,
     load_feedback_state,
@@ -26,15 +29,12 @@ from retrieval_core import (  # noqa: E402
     load_state,
     metadata_match_score,
     mutate_tags,
-    record_feedback,
-    record_pending_feedback,
+    record_shadow_comparison,
     recall_candidates,
-    register_feedback_request,
     rerank_candidates,
     route,
     save_feedback_state,
     save_state,
-    should_request_feedback,
     sync_state,
 )
 from index_store import (  # noqa: E402
@@ -45,6 +45,14 @@ from index_store import (  # noqa: E402
     update_vector_cache,
     vector_cache_path,
 )
+from jev_reranker import (  # noqa: E402
+    build_jev_request,
+    parse_jev_response,
+    read_harness_api_key,
+    JevReranker,
+    JevRerankerError,
+)
+from fake_jev import FakeJevReranker  # noqa: E402
 
 
 def catalog(size: int = 85):
@@ -91,6 +99,7 @@ class RetrievalTests(unittest.TestCase):
     def setUp(self):
         self.taxonomy, self.policy, self.provider = load_resources()
         self.skills = catalog()
+        self.enabled_digest = enabled_skill_ids_digest(skill["skill_id"] for skill in self.skills)
         self.payload = {"registry_version": "v1", "skills": self.skills}
         self.state = initialize_state(self.payload, self.taxonomy, self.provider)
 
@@ -516,17 +525,21 @@ class RetrievalTests(unittest.TestCase):
         )
         self.assertEqual(["skill-10"], result["candidate_skill_ids"])
 
-    def test_tag_then_metadata_route(self):
+    def test_tag_recall_then_jev_route(self):
+        jev = FakeJevReranker("lark-calendar")
         result = route(
             {"query": "预订明天下午的会议室并更新日历日程", "registry_version": "v1", "activation_threshold": 80, "skills": self.skills},
             self.state,
             self.taxonomy,
             self.policy,
             self.provider,
+            jev_reranker=jev,
         )
         self.assertEqual("invoke", result["decision"], msg=result)
         self.assertEqual("lark-calendar", result["selected_skill_id"])
         self.assertEqual(["productivity.calendar"], result["feedback_tags"])
+        self.assertEqual("jev-test", result["reranker_model"])
+        self.assertEqual(1, len(jev.calls))
 
     def test_route_command_uses_id_only_recall_then_candidate_metadata_rerank(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -570,7 +583,26 @@ class RetrievalTests(unittest.TestCase):
                     }
                 )
             )
-            reranked = subprocess.run(
+            reranked = rerank_candidates(
+                json.loads(route_input.read_text()),
+                self.state,
+                self.taxonomy,
+                self.policy,
+                self.provider,
+                vector_cache=load_vector_cache(
+                    directory,
+                    self.state,
+                    self.taxonomy,
+                    self.provider,
+                    required=True,
+                ),
+                jev_reranker=FakeJevReranker("lark-calendar"),
+            )
+            self.assertEqual("lark-calendar", reranked["selected_skill_id"])
+
+            environment = dict(os.environ)
+            environment["TYPESAFE_API_KEY"] = "legacy-environment-secret"
+            missing_injection = subprocess.run(
                 [
                     sys.executable,
                     str(SCRIPTS / "route_query.py"),
@@ -579,11 +611,13 @@ class RetrievalTests(unittest.TestCase):
                     "--input",
                     str(route_input),
                 ],
-                check=True,
                 capture_output=True,
                 text=True,
+                env=environment,
             )
-            self.assertEqual("lark-calendar", json.loads(reranked.stdout)["selected_skill_id"])
+            self.assertEqual(2, missing_injection.returncode)
+            self.assertIn("Harness must inject a Jev reranker", missing_injection.stdout)
+            self.assertNotIn("legacy-environment-secret", missing_injection.stdout)
 
             route_input.write_text(json.dumps({**recall_payload, "skills": self.skills}))
             rejected = subprocess.run(
@@ -725,42 +759,7 @@ class RetrievalTests(unittest.TestCase):
         status = json.loads(result.stdout)
         self.assertFalse(status["initialized"])
 
-    def test_feedback_sampling_is_deterministic_and_bounded(self):
-        self.assertFalse(should_request_feedback("interaction-1", 0.0))
-        self.assertTrue(should_request_feedback("interaction-1", 1.0))
-        first = should_request_feedback("interaction-42", 0.10, "harness-a")
-        second = should_request_feedback("interaction-42", 0.10, "harness-a")
-        self.assertEqual(first, second)
-        with self.assertRaisesRegex(ValueError, "between 0 and 1"):
-            should_request_feedback("interaction-1", 1.1)
-
-    def test_feedback_is_aggregate_only_and_requires_minimum_samples(self):
-        feedback = {
-            "schema_version": "1.0.0",
-            "total_responses": 0,
-            "skills": {},
-            "tag_skill": {},
-        }
-        for _ in range(4):
-            record_feedback(feedback, "pdf", ["content.pdf"], False)
-        self.assertEqual(
-            0.0,
-            feedback_adjustment(feedback, "pdf", ["content.pdf"], self.policy),
-        )
-        record_feedback(feedback, "pdf", ["content.pdf"], False)
-        adjustment = feedback_adjustment(feedback, "pdf", ["content.pdf"], self.policy)
-        self.assertLess(adjustment, 0.0)
-        self.assertGreaterEqual(adjustment, -self.policy["feedback_max_adjustment"])
-        for _ in range(100):
-            record_feedback(feedback, "pdf", ["content.pdf"], False)
-        self.assertGreaterEqual(
-            feedback_adjustment(feedback, "pdf", ["content.pdf"], self.policy),
-            -self.policy["feedback_max_adjustment"],
-        )
-        self.assertNotIn("queries", feedback)
-        self.assertEqual(105, feedback["total_responses"])
-
-    def test_feedback_adjusts_ambiguous_skill_selection(self):
+    def test_jev_choice_is_not_overridden_by_shadow_rerank_scores(self):
         skills = catalog()
         skills[0] = {
             "skill_id": "calendar-a",
@@ -781,283 +780,35 @@ class RetrievalTests(unittest.TestCase):
             "activation_threshold": 80,
             "skills": skills,
         }
-        before = route(payload, state, self.taxonomy, self.policy, self.provider)
-        self.assertEqual("none", before["decision"])
-
         feedback = {
-            "schema_version": "1.1.0",
-            "total_responses": 0,
+            "schema_version": "1.2.0",
+            "total_comparisons": 16,
+            "agreements": 0,
+            "disagreements": 16,
             "skills": {},
             "tag_skill": {},
             "rerank_skills": {
-                "calendar-a": {"positive": 8, "negative": 0},
-                "calendar-b": {"positive": 0, "negative": 8},
+                "calendar-a": {"positive": 0, "negative": 8},
+                "calendar-b": {"positive": 8, "negative": 0},
             },
         }
-        after = route(payload, state, self.taxonomy, self.policy, self.provider, feedback)
-        self.assertEqual("invoke", after["decision"])
-        self.assertEqual("calendar-a", after["selected_skill_id"])
-        self.assertIn("rerank_feedback_applied", after["reason_codes"])
-
-    def test_feedback_cli_records_and_reports_aggregate_counts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            save_state(directory, self.state)
-            route_result_path = Path(directory) / "route-result.json"
-            route_result_path.write_text(
-                json.dumps(
-                    {
-                        "decision": "invoke",
-                        "selected_skill_id": "pdf",
-                        "matched_tags": ["content.pdf"],
-                        "feedback_tags": ["content.pdf"],
-                        "candidate_skill_ids": ["pdf"],
-                    }
-                )
-            )
-            sampled = self.run_cli(
-                directory,
-                "request-feedback",
-                "--interaction-id",
-                "completed-task-1",
-                "--route-result",
-                str(route_result_path),
-                "--query",
-                "Read and render a PDF",
-                "--sample-rate",
-                "1",
-            )
-            self.assertTrue(sampled["sampled"])
-            persisted_text = (Path(directory) / "feedback-stats.json").read_text()
-            self.assertNotIn("completed-task-1", persisted_text)
-            self.assertNotIn("Read and render a PDF", persisted_text)
-            self.assertIn("sha256:", persisted_text)
-
-            recorded = self.run_cli(
-                directory,
-                "record-feedback",
-                "--interaction-id",
-                "completed-task-1",
-                "--rating",
-                "accurate",
-            )
-            self.assertEqual("accurate", recorded["rating"])
-            persisted = load_feedback_state(directory)
-            self.assertEqual(1, persisted["skills"]["pdf"]["positive"])
-
-            report = self.run_cli(directory, "feedback-status", "pdf")
-            self.assertEqual(1, report["total_responses"])
-
-            duplicate = subprocess.run(
-                [
-                    sys.executable,
-                    str(CLI),
-                    "--state-dir",
-                    directory,
-                    "record-feedback",
-                    "--interaction-id",
-                    "completed-task-1",
-                    "--rating",
-                    "accurate",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(2, duplicate.returncode)
-            self.assertIn("already answered", duplicate.stderr)
-
-            invalid_route_path = Path(directory) / "invalid-route-result.json"
-            invalid_route_path.write_text(
-                json.dumps(
-                    {
-                        "decision": "invoke",
-                        "selected_skill_id": "pdf",
-                        "matched_tags": ["productivity.calendar"],
-                        "feedback_tags": ["productivity.calendar"],
-                        "candidate_skill_ids": ["pdf"],
-                    }
-                )
-            )
-            invalid_tag = subprocess.run(
-                [
-                    sys.executable,
-                    str(CLI),
-                    "--state-dir",
-                    directory,
-                    "request-feedback",
-                    "--interaction-id",
-                    "completed-task-invalid-tag",
-                    "--route-result",
-                    str(invalid_route_path),
-                    "--query",
-                    "Read a PDF",
-                    "--sample-rate",
-                    "1",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(2, invalid_tag.returncode)
-            self.assertIn("not assigned", invalid_tag.stderr)
-
-    def record_negative_case(
-        self,
-        feedback,
-        tag_state,
-        route_result,
-        query,
-        expected_skill_id,
-        expected_tags,
-        index,
-    ):
-        interaction_id = f"negative-case-{index}"
-        self.assertTrue(
-            register_feedback_request(
-                feedback,
-                interaction_id,
-                route_result,
-                self.provider.embed(query),
-                1.0,
-            )
-        )
-        return record_pending_feedback(
-            feedback,
-            interaction_id,
-            False,
-            tag_state,
-            expected_skill_id,
-            expected_tags,
-        )
-
-    def test_negative_feedback_classifies_query_tag_mismatch(self):
-        feedback = {"schema_version": "1.1.0", "pending": {}}
-        route_result = {
-            "decision": "invoke",
-            "selected_skill_id": "lark-calendar",
-            "matched_tags": ["productivity.calendar"],
-            "feedback_tags": ["productivity.calendar"],
-            "candidate_skill_ids": ["lark-calendar"],
-        }
-        result = None
-        query = "Find the historical meeting transcript"
-        for index in range(5):
-            result = self.record_negative_case(
-                feedback,
-                self.state,
-                route_result,
-                query,
-                "lark-vc",
-                ["collaboration.meetings"],
-                index,
-            )
-        self.assertIn("query_tag_mismatch", result["root_causes"])
-        self.assertIn("candidate_recall_error", result["root_causes"])
-        self.assertNotIn("skill_tag_annotation_error", result["root_causes"])
-        correction = feedback["query_tag_corrections"]["productivity.calendar"][
-            "collaboration.meetings"
-        ]
-        self.assertEqual(5, correction["samples"])
-        corrected, applied = corrected_tag_scores(
-            self.provider.embed(query),
-            {"productivity.calendar": 0.60, "collaboration.meetings": 0.25},
-            feedback,
+        result = route(
+            payload,
+            state,
+            self.taxonomy,
             self.policy,
+            self.provider,
+            feedback,
+            jev_reranker=FakeJevReranker("calendar-a"),
         )
-        self.assertTrue(applied)
-        self.assertGreater(corrected["collaboration.meetings"], 0.25)
-        self.assertLess(corrected["productivity.calendar"], 0.60)
+        self.assertEqual("invoke", result["decision"])
+        self.assertEqual("calendar-a", result["selected_skill_id"])
+        self.assertEqual(["jev_choice"], result["reason_codes"])
 
-    def test_negative_feedback_cli_requires_and_reports_root_cause(self):
-        with tempfile.TemporaryDirectory() as directory:
-            save_state(directory, self.state)
-            route_path = Path(directory) / "wrong-route.json"
-            route_path.write_text(
-                json.dumps(
-                    {
-                        "decision": "invoke",
-                        "selected_skill_id": "lark-calendar",
-                        "matched_tags": ["productivity.calendar"],
-                        "feedback_tags": ["productivity.calendar"],
-                        "candidate_skill_ids": ["lark-calendar"],
-                    }
-                )
-            )
-            sampled = self.run_cli(
-                directory,
-                "request-feedback",
-                "--interaction-id",
-                "negative-cli-1",
-                "--route-result",
-                str(route_path),
-                "--query",
-                "Find the historical meeting transcript",
-                "--sample-rate",
-                "1",
-            )
-            self.assertTrue(sampled["sampled"])
-            recorded = self.run_cli(
-                directory,
-                "record-feedback",
-                "--interaction-id",
-                "negative-cli-1",
-                "--rating",
-                "inaccurate",
-                "--expected-skill-id",
-                "lark-vc",
-                "--expected-tags",
-                "collaboration.meetings",
-            )
-            self.assertIn("query_tag_mismatch", recorded["root_causes"])
-            self.assertIn("candidate_recall_error", recorded["root_causes"])
-
-            missing_correction = subprocess.run(
-                [
-                    sys.executable,
-                    str(CLI),
-                    "--state-dir",
-                    directory,
-                    "record-feedback",
-                    "--interaction-id",
-                    "missing-correction",
-                    "--rating",
-                    "inaccurate",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(2, missing_correction.returncode)
-            self.assertIn("requires expected_skill_id", missing_correction.stderr)
-
-    def test_negative_feedback_classifies_skill_tag_annotation_error(self):
-        self.assertNotIn("content.documents", self.state["skills"]["pdf"]["effective_tags"])
-        feedback = {"schema_version": "1.1.0", "pending": {}}
-        route_result = {
-            "decision": "invoke",
-            "selected_skill_id": "lark-calendar",
-            "matched_tags": ["content.documents"],
-            "feedback_tags": ["productivity.calendar"],
-            "candidate_skill_ids": ["lark-calendar"],
-        }
-        result = None
-        for index in range(5):
-            result = self.record_negative_case(
-                feedback,
-                self.state,
-                route_result,
-                "Edit this document",
-                "pdf",
-                ["content.documents"],
-                100 + index,
-            )
-        self.assertIn("skill_tag_annotation_error", result["root_causes"])
-        self.assertIn("candidate_recall_error", result["root_causes"])
-        self.assertNotIn("query_tag_mismatch", result["root_causes"])
-        candidate_tags = candidate_effective_tags(
-            self.state["skills"]["pdf"], feedback, "pdf", self.policy
-        )
-        self.assertIn("content.documents", candidate_tags)
-        routed = route(
+    def test_jev_fit_gate_can_reject_all_candidates(self):
+        result = route(
             {
-                "query": "Edit this document",
+                "query": "预订明天下午的会议室并更新日历日程",
                 "registry_version": "v1",
                 "activation_threshold": 80,
                 "skills": self.skills,
@@ -1066,60 +817,295 @@ class RetrievalTests(unittest.TestCase):
             self.taxonomy,
             self.policy,
             self.provider,
-            feedback,
+            jev_reranker=FakeJevReranker("lark-calendar", best_fit=0.1),
         )
-        self.assertIn("pdf", routed["candidate_skill_ids"])
-        self.assertIn("annotation_feedback_applied", routed["reason_codes"])
+        self.assertEqual("none", result["decision"])
+        self.assertIsNone(result["selected_skill_id"])
+        self.assertEqual(["jev_no_candidate_fit"], result["reason_codes"])
 
-    def test_negative_feedback_classifies_rerank_error(self):
-        feedback = {"schema_version": "1.1.0", "pending": {}}
-        route_result = {
+    def test_jev_request_hides_recall_order_and_scores(self):
+        request = build_jev_request(
+            "read this document",
+            [self.skills[2], self.skills[0]],
+            "jev-test",
+        )
+        criteria = request["questions"]["which"]["criteria"]
+        self.assertEqual(["lark-calendar", "pdf"], list(criteria))
+        self.assertNotIn("score", json.dumps(request).casefold())
+
+    def test_jev_response_rejects_skill_outside_candidate_set(self):
+        response = {
+            "model": "jev-test",
+            "answers": {
+                "which": {
+                    "type": "choice",
+                    "choice": "outside",
+                    "probabilities": {"pdf": 1.0},
+                    "confidence": 1.0,
+                },
+                "fits::pdf": {"type": "noul", "noul": 1.0},
+            },
+        }
+        with self.assertRaisesRegex(JevRerankerError, "outside"):
+            parse_jev_response(response, ["pdf"])
+
+    def test_jev_http_client_uses_typed_choice_and_fit_answers(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self, limit):
+                return json.dumps(
+                    {
+                        "model": "jev-1.test",
+                        "answers": {
+                            "which": {
+                                "type": "choice",
+                                "choice": "pdf",
+                                "probabilities": {"lark-calendar": 0.1, "pdf": 0.9},
+                                "confidence": 0.85,
+                            },
+                            "fits::lark-calendar": {"type": "noul", "noul": 0.1},
+                            "fits::pdf": {"type": "noul", "noul": 0.95},
+                        },
+                        "usage": {"input_tokens": 10, "output_tokens": 4},
+                    }
+                ).encode()
+
+        client = JevReranker(
+            "secret",
+            endpoint="https://typesafe.invalid",
+            model="jev-test",
+            max_attempts=1,
+        )
+        with patch("jev_reranker.urllib.request.urlopen", return_value=Response()) as mocked:
+            result = client.select("read a PDF", [self.skills[2], self.skills[0]])
+        self.assertEqual("pdf", result["winner"])
+        request = mocked.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual("jev-test", payload["model"])
+        self.assertEqual(["lark-calendar", "pdf"], list(payload["questions"]["which"]["criteria"]))
+        self.assertEqual("Bearer secret", request.get_header("Authorization"))
+
+    def test_jev_requires_harness_injected_api_key(self):
+        with self.assertRaisesRegex(JevRerankerError, "Harness must inject"):
+            JevReranker.from_policy(self.policy, api_key="  ")
+
+    def test_jev_policy_uses_harness_injected_api_key(self):
+        client = JevReranker.from_policy(self.policy, api_key=" harness-secret\n")
+        self.assertEqual("harness-secret", client.api_key)
+        self.assertEqual("jev-latest", client.model)
+
+    def test_harness_api_key_file_is_bounded_and_trimmed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            secret_path = Path(directory) / "jev-key"
+            secret_path.write_text(" injected-secret\n", encoding="utf-8")
+            self.assertEqual("injected-secret", read_harness_api_key(str(secret_path)))
+
+            secret_path.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(JevRerankerError, "Harness must inject"):
+                read_harness_api_key(str(secret_path))
+
+    def test_shadow_comparison_cli_records_agreement_without_user_feedback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            save_state(directory, self.state)
+            save_vector_cache(
+                directory,
+                build_vector_cache(self.skills, self.state, self.taxonomy, self.provider),
+            )
+            enhanced_path = Path(directory) / "enhanced-result.json"
+            baseline_path = Path(directory) / "baseline-result.json"
+            enhanced_path.write_text(
+                json.dumps(
+                    {
+                        "decision": "invoke",
+                        "selected_skill_id": "pdf",
+                        "matched_tags": ["content.pdf"],
+                        "feedback_tags": ["content.pdf"],
+                        "candidate_skill_ids": ["pdf"],
+                        "registry_version": "v1",
+                        "enabled_skill_ids_digest": self.enabled_digest,
+                    }
+                )
+            )
+            baseline_path.write_text(
+                json.dumps(
+                    {
+                        "decision": "invoke",
+                        "selected_skill_id": "pdf",
+                        "registry_version": "v1",
+                        "enabled_skill_ids_digest": self.enabled_digest,
+                    }
+                )
+            )
+            recorded = self.run_cli(
+                directory,
+                "compare-routing",
+                "--comparison-id",
+                "completed-task-1",
+                "--enhanced-result",
+                str(enhanced_path),
+                "--baseline-result",
+                str(baseline_path),
+                "--query",
+                "Read and render a PDF",
+            )
+            self.assertTrue(recorded["agreement"])
+            self.assertEqual(["baseline_agreement"], recorded["root_causes"])
+            persisted_text = (Path(directory) / "feedback-stats.json").read_text()
+            self.assertNotIn("completed-task-1", persisted_text)
+            self.assertNotIn("Read and render a PDF", persisted_text)
+            self.assertIn("sha256:", persisted_text)
+            persisted = load_feedback_state(directory)
+            self.assertEqual(1, persisted["skills"]["pdf"]["positive"])
+
+            report = self.run_cli(directory, "comparison-status", "pdf")
+            self.assertEqual(1, report["total_comparisons"])
+            self.assertEqual(1, report["agreements"])
+
+            duplicate = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI),
+                    "--state-dir",
+                    directory,
+                    "compare-routing",
+                    "--comparison-id",
+                    "completed-task-1",
+                    "--enhanced-result",
+                    str(enhanced_path),
+                    "--baseline-result",
+                    str(baseline_path),
+                    "--query",
+                    "Read and render a PDF",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(2, duplicate.returncode)
+            self.assertIn("already recorded", duplicate.stderr)
+
+    def test_shadow_comparison_cli_uses_native_hit_as_pseudo_correct_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            save_state(directory, self.state)
+            save_vector_cache(
+                directory,
+                build_vector_cache(self.skills, self.state, self.taxonomy, self.provider),
+            )
+            enhanced_path = Path(directory) / "enhanced-result.json"
+            baseline_path = Path(directory) / "baseline-result.json"
+            enhanced_path.write_text(
+                json.dumps(
+                    {
+                        "decision": "invoke",
+                        "selected_skill_id": "lark-calendar",
+                        "matched_tags": ["productivity.calendar"],
+                        "feedback_tags": ["productivity.calendar"],
+                        "candidate_skill_ids": ["lark-calendar"],
+                        "registry_version": "v1",
+                        "enabled_skill_ids_digest": self.enabled_digest,
+                    }
+                )
+            )
+            baseline_path.write_text(
+                json.dumps(
+                    {
+                        "decision": "invoke",
+                        "selected_skill_id": "lark-vc",
+                        "registry_version": "v1",
+                        "enabled_skill_ids_digest": self.enabled_digest,
+                    }
+                )
+            )
+            recorded = None
+            for index in range(5):
+                recorded = self.run_cli(
+                    directory,
+                    "compare-routing",
+                    "--comparison-id",
+                    f"native-comparison-{index}",
+                    "--enhanced-result",
+                    str(enhanced_path),
+                    "--baseline-result",
+                    str(baseline_path),
+                    "--query",
+                    "Find the historical meeting transcript",
+                )
+            self.assertIn("query_tag_mismatch", recorded["root_causes"])
+            self.assertIn("candidate_recall_error", recorded["root_causes"])
+            self.assertEqual(["collaboration.meetings"], recorded["inferred_intent_tags"])
+            feedback = load_feedback_state(directory)
+            self.assertEqual(5, feedback["disagreements"])
+            self.assertEqual(
+                5,
+                feedback["query_tag_corrections"]["productivity.calendar"]
+                ["collaboration.meetings"]["samples"],
+            )
+
+    def test_shadow_comparison_classifies_rerank_error(self):
+        feedback = empty_feedback_state()
+        enhanced_result = {
             "decision": "invoke",
             "selected_skill_id": "lark-vc",
             "matched_tags": ["collaboration.meetings", "productivity.calendar"],
             "feedback_tags": ["collaboration.meetings"],
             "candidate_skill_ids": ["lark-vc", "lark-calendar"],
+            "registry_version": "v1",
+            "enabled_skill_ids_digest": self.enabled_digest,
+        }
+        baseline_result = {
+            "decision": "invoke",
+            "selected_skill_id": "lark-calendar",
+            "registry_version": "v1",
+            "enabled_skill_ids_digest": self.enabled_digest,
         }
         result = None
         for index in range(5):
-            result = self.record_negative_case(
+            result = record_shadow_comparison(
                 feedback,
-                self.state,
-                route_result,
+                f"rerank-comparison-{index}",
                 "Schedule a future calendar meeting",
-                "lark-calendar",
-                ["productivity.calendar"],
-                200 + index,
+                enhanced_result,
+                baseline_result,
+                self.state,
+                self.taxonomy,
+                self.provider,
             )
         self.assertEqual(["skill_rerank_error"], result["root_causes"])
         self.assertEqual(5, feedback["rerank_skills"]["lark-calendar"]["positive"])
         self.assertEqual(5, feedback["rerank_skills"]["lark-vc"]["negative"])
 
-    def test_negative_feedback_classifies_over_recall(self):
-        feedback = {"schema_version": "1.1.0", "pending": {}}
-        route_result = {
+    def test_shadow_comparison_classifies_over_recall(self):
+        feedback = empty_feedback_state()
+        enhanced_result = {
             "decision": "invoke",
             "selected_skill_id": "lark-calendar",
             "matched_tags": ["productivity.calendar"],
             "feedback_tags": ["productivity.calendar"],
             "candidate_skill_ids": ["lark-calendar"],
+            "registry_version": "v1",
+            "enabled_skill_ids_digest": self.enabled_digest,
+        }
+        baseline_result = {
+            "decision": "none",
+            "selected_skill_id": None,
+            "registry_version": "v1",
+            "enabled_skill_ids_digest": self.enabled_digest,
         }
         result = None
         for index in range(5):
-            interaction_id = f"over-recall-{index}"
-            register_feedback_request(
+            result = record_shadow_comparison(
                 feedback,
-                interaction_id,
-                route_result,
-                self.provider.embed("Just answer this general question"),
-                1.0,
-            )
-            result = record_pending_feedback(
-                feedback,
-                interaction_id,
-                False,
+                f"over-recall-{index}",
+                "Just answer this general question",
+                enhanced_result,
+                baseline_result,
                 self.state,
-                expected_none=True,
+                self.taxonomy,
+                self.provider,
             )
         self.assertEqual(["over_recall"], result["root_causes"])
         corrected, applied = corrected_tag_scores(
@@ -1130,6 +1116,55 @@ class RetrievalTests(unittest.TestCase):
         )
         self.assertTrue(applied)
         self.assertLess(corrected["productivity.calendar"], 0.5)
+
+    def test_shadow_comparison_rejects_different_enabled_sets_without_mutation(self):
+        feedback = empty_feedback_state()
+        enhanced_result = {
+            "decision": "invoke",
+            "selected_skill_id": "pdf",
+            "matched_tags": ["content.pdf"],
+            "feedback_tags": ["content.pdf"],
+            "candidate_skill_ids": ["pdf"],
+            "registry_version": "v1",
+            "enabled_skill_ids_digest": self.enabled_digest,
+        }
+        baseline_result = {
+            "decision": "invoke",
+            "selected_skill_id": "pdf",
+            "registry_version": "v1",
+            "enabled_skill_ids_digest": enabled_skill_ids_digest(["pdf"]),
+        }
+        with self.assertRaisesRegex(ValueError, "enabled Skill sets differ"):
+            record_shadow_comparison(
+                feedback,
+                "different-enabled-set",
+                "Read a PDF",
+                enhanced_result,
+                baseline_result,
+                self.state,
+                self.taxonomy,
+                self.provider,
+            )
+        self.assertEqual(0, feedback["total_comparisons"])
+        self.assertEqual({}, feedback["processed_comparisons"])
+
+    def test_legacy_user_feedback_is_not_carried_into_shadow_comparisons(self):
+        with tempfile.TemporaryDirectory() as directory:
+            save_feedback_state(
+                directory,
+                {
+                    "schema_version": "1.1.0",
+                    "total_responses": 9,
+                    "skills": {"pdf": {"positive": 9, "negative": 0}},
+                    "rerank_skills": {"pdf": {"positive": 9, "negative": 0}},
+                    "pending": {"sha256:legacy": {}},
+                },
+            )
+            migrated = load_feedback_state(directory)
+            self.assertEqual("1.2.0", migrated["schema_version"])
+            self.assertEqual(0, migrated["total_comparisons"])
+            self.assertEqual({}, migrated["skills"])
+            self.assertNotIn("pending", migrated)
 
     def test_harness_removal_prunes_skill_feedback(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -10,27 +10,44 @@
     {
       "required": ["operation"],
       "properties": {
-        "operation": {"enum": ["initialize_tags", "rebuild_tags", "sync_tags", "set_tags", "reclassify_tags", "inspect_tags", "request_feedback", "record_feedback", "feedback_status", "benchmark"]}
+        "operation": {"enum": ["initialize_tags", "rebuild_tags", "sync_tags", "set_tags", "reclassify_tags", "inspect_tags", "comparison_status", "benchmark"]}
+      }
+    },
+    {
+      "required": ["operation", "comparison_id", "query", "enhanced_result", "baseline_result"],
+      "properties": {
+        "operation": {"const": "compare_routing"}
       }
     }
   ],
   "properties": {
-    "operation": {"enum": ["initialize_tags", "rebuild_tags", "sync_tags", "set_tags", "reclassify_tags", "inspect_tags", "request_feedback", "record_feedback", "feedback_status", "benchmark"]},
+    "operation": {"enum": ["initialize_tags", "rebuild_tags", "sync_tags", "set_tags", "reclassify_tags", "inspect_tags", "compare_routing", "comparison_status", "benchmark"]},
     "registry_version": {"type": "string"},
     "activation_threshold": {"type": "integer", "minimum": 1},
     "query": {"type": "string"},
     "enabled_skill_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
     "candidate_skills": {"type": "array", "items": {"$ref": "#/$defs/skill"}},
-    "interaction_id": {"type": "string"},
+    "comparison_id": {"type": "string"},
     "skill_id": {"type": "string"},
     "feedback_tags": {"type": "array", "items": {"type": "string"}},
-    "rating": {"enum": ["accurate", "inaccurate"]},
-    "expected_skill_id": {"type": "string"},
-    "expected_tags": {"type": "array", "items": {"type": "string"}},
-    "expected_none": {"type": "boolean"},
+    "enhanced_result": {"$ref": "#/$defs/route_result"},
+    "baseline_result": {"$ref": "#/$defs/route_result"},
     "skills": {"type": "array", "items": {"$ref": "#/$defs/skill"}}
   },
   "$defs": {
+    "route_result": {
+      "type": "object",
+      "required": ["decision", "selected_skill_id", "registry_version", "enabled_skill_ids_digest"],
+      "properties": {
+        "decision": {"enum": ["invoke", "none"]},
+        "selected_skill_id": {"type": ["string", "null"]},
+        "matched_tags": {"type": "array", "items": {"type": "string"}},
+        "feedback_tags": {"type": "array", "items": {"type": "string"}},
+        "candidate_skill_ids": {"type": "array", "items": {"type": "string"}},
+        "registry_version": {"type": "string"},
+        "enabled_skill_ids_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
     "skill": {
       "type": "object",
       "required": ["skill_id", "name", "description"],

@@ -7,7 +7,7 @@
 本项目实现两项紧密相关的能力：
 
 1. 持续维护 Skill 标签库，支持用户手工标签和 agent 自动标签。
-2. 仅在 Skill 数量超过阈值时，通过标签向量召回候选，再对候选 Skill 元数据进行向量精排。
+2. 仅在 Skill 数量超过阈值时，通过标签向量召回候选，再由 TypeSafe Jev 对候选 Skill 元数据进行语义决策。
 
 agent/harness 自身的 Skill 注册表始终是 Skill 元数据的唯一数据源。本项目不接管 Skill 的安装、存储和版本管理。
 
@@ -41,7 +41,7 @@ Skill 数量超过阈值
 → 对话匹配标签向量
 → 标签筛选候选 Skill ID
 → harness 只加载候选 Skill 元数据
-→ 元数据向量精排
+→ Jev Choice + Noul fit 精排
 → 返回一个 Skill 或 none
 ```
 
@@ -87,8 +87,10 @@ else:
 - `tag_top_k: 5`
 - `candidate_skill_limit: 32`
 - `minimum_tag_score: 0.28`
-- `minimum_skill_score: 0.42`
-- `minimum_winner_margin: 0.05`
+- `jev_model: jev-latest`
+- `jev_fit_threshold: 0.30`
+- `jev_timeout_seconds: 5.0`
+- `jev_max_attempts: 2`
 
 阈值由不同 harness 独立配置。增强器收到未超过阈值的路由请求时返回 `bypass`，但初始化、同步和人工标签操作不受该阈值限制。
 
@@ -106,7 +108,7 @@ harness 在普通对话的第一阶段只提供：
 
 标签召回返回候选 ID 后，harness 只加载候选 Skill 的元数据，并在第二阶段增加
 `candidate_skills` 字段。增强器重新计算候选集合，要求候选元数据与召回 ID 完全一致，
-校验元数据指纹后再精排。完整 Skill 快照只用于首次 `initialize_tags`、显式
+校验元数据指纹后再交给 Jev 精排。完整 Skill 快照只用于首次 `initialize_tags`、显式
 `rebuild_tags`，不进入普通对话路由。
 
 支持的操作：
@@ -117,8 +119,8 @@ harness 在普通对话的第一阶段只提供：
 - `reclassify_tags`：让 agent 重新分析指定 Skill。
 - `route`：仅在超过阈值时执行标签召回和精排。
 - `inspect_tags`：查看 Skill 的标签、来源和生成依据。
-- `request_feedback`：任务成功完成后，按配置随机决定是否询问 Skill 选择准确性。
-- `record_feedback`：消费一次性反馈请求，并记录准确或不准确的聚合计数。
+- `compare_routing`：对比同一查询的增强结果与 harness 原生结果，并自动累计修正。
+- `comparison_status`：查看自动对比次数、差异归因和修正统计。
 - `benchmark`：对比标签增强与全量元数据匹配的查询吞吐量和延迟。
 
 检索增强器只引用 `skill_id` 和 harness 提供的元数据，不依赖 Skill 的实际存储路径。
@@ -278,25 +280,20 @@ candidate skill metadata vectors
    ├─ 对话向量匹配标签向量
    ├─ Top-K 标签映射为候选 Skill ID
    ├─ harness 提供候选 Skill 元数据
-   ├─ 候选元数据向量匹配与规则重排
+   ├─ Jev Choice 选择与逐候选 Noul fit 判断
    └─ 返回一个 Skill 或 none
 ```
 
-候选 Skill 取命中标签下 Skill ID 的并集。超过上限时，根据标签得分、显式平台、文件类型、动作匹配和初步元数据得分裁剪。
+候选 Skill 取命中标签下 Skill ID 的并集。超过上限时，标签得分只负责裁剪到高召回候选集，不决定最终 Skill。
 
-最终评分：
+最终决策：
 
 ```text
-final_score =
-    metadata_vector_similarity
-  + explicit_name_bonus
-  + platform_artifact_action_bonus
-  + context_continuity_bonus
-  - exclusion_penalty
-  - hard_mismatch_penalty
+Jev Choice(candidate metadata) → winner + probability distribution
+Jev Noul(each candidate)      → absolute fit probability
 ```
 
-只有第一名达到最低分数且领先第二名达到最小分差时才返回该 Skill，否则返回 `none`。
+所有候选 fit 概率都低于门槛时返回 `none`，否则返回 Choice winner。召回分数、历史第一名和原有候选顺序不传给 Jev；模型输出必须通过候选集合、概率范围、注册表版本和元数据指纹校验。
 
 ## 12. 输出协议
 
@@ -305,7 +302,7 @@ final_score =
 - `invoke`：返回一个 `selected_skill_id`。
 - `none`：没有足够可靠的匹配。
 - `bypass`：Skill 数量未超过阈值，应使用 harness 原生匹配。
-- `error`：同步、标签或 embedding 失败，不擅自调用 Skill。
+- `error`：同步、标签、embedding 或 Jev 失败，不擅自调用 Skill。
 
 示例：
 
@@ -314,9 +311,13 @@ final_score =
   "decision": "invoke",
   "selected_skill_id": "lark-calendar",
   "confidence": 0.84,
+  "winner_probability": 0.82,
   "matched_tags": ["productivity.calendar"],
   "candidate_skill_ids": ["lark-calendar", "lark-vc"],
-  "reason_codes": ["decisive_metadata_match"],
+  "candidate_choice_scores": {"lark-calendar": 0.82, "lark-vc": 0.18},
+  "candidate_fit_scores": {"lark-calendar": 0.91, "lark-vc": 0.24},
+  "reranker_model": "jev-1.x",
+  "reason_codes": ["jev_choice"],
   "registry_version": "harness-defined-version"
 }
 ```
@@ -336,6 +337,7 @@ enhance-skill-retrieval/
 │   ├── set_tags.py
 │   ├── classify_tags.py
 │   ├── build_vectors.py
+│   ├── jev_reranker.py
 │   ├── route_query.py
 │   └── evaluate_retrieval.py
 └── references/
@@ -361,10 +363,13 @@ on user_query:
     if skills.count > configured_threshold:
         candidates = recall(query, registry_version, enabled_skill_ids)
         metadata = registry.load_metadata(candidates.skill_ids)
-        rerank(query, registry_version, enabled_skill_ids, metadata)
+        jev = JevReranker.from_policy(policy, api_key=secret_store.resolve("typesafe/jev"))
+        rerank(query, registry_version, enabled_skill_ids, metadata, jev_reranker=jev)
     else:
         continue native routing
 ```
+
+密钥由 harness 的安全存储解析并注入 Jev 客户端，不进入 Skill 配置、路由 JSON、环境变量或持久化状态。子进程集成使用 harness 持有的秘密文件或继承文件描述符作为注入边界。
 
 `SKILL.md` 的 description 应明确两种用途：根据 harness 变更维护 Skill 标签，以及在 Skill 数量超过阈值时进行检索增强。
 
@@ -393,7 +398,7 @@ on user_query:
 ### 阶段 D：检索增强
 
 - 仅在超过阈值时构建或加载标签向量。
-- 实现标签 Top-K 召回、候选裁剪和元数据精排。
+- 实现标签 Top-K 召回、候选裁剪和 Jev 语义精排。
 - 实现 `invoke`、`none`、`bypass` 和 `error`。
 
 ### 阶段 E：Harness 适配
@@ -409,16 +414,15 @@ on user_query:
 - 对比阈值以上标签召回与全量匹配的准确率和延迟。
 - 使用同一批查询分别测量标签增强检索和全量元数据检索的吞吐量、平均延迟、P50 与 P95。
 
-### 阶段 G：用户反馈闭环
+### 阶段 G：原生路由影子对比闭环
 
-- 只在成功调用 Skill 并完成任务后执行反馈抽样。
-- 默认随机抽样率为 10%，允许 harness 覆盖。
-- 用户可反馈本次 Skill 选择“准确”或“不准确”，也可以跳过；负反馈需要提供正确 Skill 与需求标签，或确认不应调用 Skill。
-- 对比本次命中标签、需求标签和正确 Skill 已标注标签，分别识别查询标签错误、Skill 标签标注错误、候选漏召回和精排错误；多种根因可以同时存在。
-- 查询标签错误更新相似查询的标签纠偏原型；Skill 标注错误累计虚拟标签建议；只有正确 Skill 已在候选集中时才更新精排反馈。
-- 只保存聚合计数、派生查询向量和有数量上限的一次性 interaction 哈希；不保存原始 interaction ID、用户身份、查询文本、响应或任务产物。
-- 少于 5 条同类反馈时不影响路由；达到门槛后才应用对应修正，且显式指定 Skill 时不受反馈影响。
-- 通过 harness 删除 Skill 时同步删除对应反馈统计。
+- harness 对同一查询独立执行增强检索与原生 Skill 匹配，不向用户询问准确性。
+- 将原生匹配命中的 Skill 或原生 `none` 作为伪正确结果，自动与增强结果比较。
+- 从原生命中 Skill 的受控有效标签中推断最相关主题，判断查询标签错误、候选漏召回、精排错误或过度召回。
+- 普通检索仍只接收 `query + registry_version + enabled_skill_ids`；原生对比由 harness 在检索 seam 外执行，不向增强路由传递完整目录。
+- 只保存聚合计数、派生查询向量和有数量上限的 comparison 哈希；不保存原始 ID、用户身份、查询文本、响应或任务产物。
+- 少于 5 条同类对比时不影响路由；达到门槛后才应用对应修正，且显式指定 Skill 时不受修正影响。
+- 通过 harness 删除 Skill 时同步删除对应自动对比统计。
 
 ### 阶段 H：封装与验证
 
@@ -439,8 +443,8 @@ on user_query:
 - 在 500 个 Skills 下，相对全量匹配的路由计算 P95 延迟至少降低 30%。
 - 删除向量缓存后，能够根据标签库和 harness 元数据恢复检索能力。
 - 性能报告同时提供增强检索与全量元数据检索的 QPS、平均延迟、P50、P95、准确率和结果一致率。
-- 反馈未达到最小样本数时路由结果不发生变化，反馈调整绝对值不超过配置上限。
-- 反馈状态不包含原始查询、用户身份、任务响应或任务产物。
+- 自动对比未达到最小样本数时路由结果不发生变化，调整绝对值不超过配置上限。
+- 自动对比状态不包含原始查询、用户身份、任务响应或任务产物。
 
 ## 17. 开工前需要确认
 

@@ -50,11 +50,8 @@ enhance-skill remove-tags <skill-id> <tag>...
 enhance-skill lock-tags <skill-id> <tag>...
 enhance-skill unlock-tags <skill-id> <tag>...
 enhance-skill reclassify-tags <skill-id> --input <skill.json>
-enhance-skill request-feedback --interaction-id <id> --route-result <result.json> --query <query>
-enhance-skill record-feedback --interaction-id <id> --rating accurate
-enhance-skill record-feedback --interaction-id <id> --rating inaccurate --expected-skill-id <id> --expected-tags <tag>...
-enhance-skill record-feedback --interaction-id <id> --rating inaccurate --expected-none
-enhance-skill feedback-status [skill-id]
+enhance-skill compare-routing --comparison-id <id> --enhanced-result <result.json> --baseline-result <result.json> --query <query>
+enhance-skill comparison-status [skill-id]
 ```
 
 Pass `--json` before the subcommand for structured output. Manual tags override generated tags. Locked tags survive metadata updates. `unlock-tags` retains the tag as manual; use `remove-tags` to delete the manual assignment.
@@ -67,15 +64,17 @@ Compare tag-enhanced retrieval with full-catalog metadata matching:
 python3 scripts/benchmark_retrieval.py \
   --catalog <catalog.json> \
   --cases <cases.jsonl> \
+  --jev-api-key-file <harness-secret-path-or-/dev/fd/N> \
   --synthetic-size 500 \
   --iterations 20
 ```
 
 The report includes query throughput, mean/P50/P95 latency, expected accuracy, result agreement, and P95 speedup. Treat timing as a benchmark report, not a unit-test pass condition.
+The enhanced arm makes live Jev requests. The harness must supply its credential through `--jev-api-key-file`; the value may be a protected secret-file path or an inherited descriptor such as `/dev/fd/N`. Its latency includes the external service and the run consumes API usage.
 
-### Collect feedback
+### Compare enhanced and native routing
 
-After an invoked Skill completes successfully, call `request-feedback` with the route result and query. Ask the returned question only when sampled. A negative answer must identify the correct Skill and intended controlled tags, or state that no Skill was needed. Follow [feedback-protocol.md](feedback-protocol.md); never collect feedback before task completion or persist the raw conversation.
+For the same query, registry version, and enabled Skill set, let the harness run its native Skill selector independently of the enhanced route. Both results must include the same SHA-256 digest of the sorted enabled Skill IDs. Pass both final route results to `compare-routing`. The native selected Skill, or native `none`, is the pseudo-correct result; no user rating is requested. Follow [feedback-protocol.md](feedback-protocol.md). Ordinary enhanced routing must still receive no complete catalog.
 
 ### Route
 
@@ -111,11 +110,22 @@ those IDs and calls the same script again:
 ```
 
 The second call recomputes recall, requires the candidate metadata IDs to exactly
-match the recalled IDs, validates metadata fingerprints, and then returns `invoke`
-or `none`. A small enabled set returns `bypass` on the first call. Version drift,
-unknown enabled IDs, full-catalog `skills` input, stale candidate metadata, and a
-missing vector cache fail closed with `error`.
+match the recalled IDs, validates metadata fingerprints, and sends all candidates
+to TypeSafe Jev. A `Choice` answer selects the winner; one `Noul` answer per candidate
+provides an absolute fit gate that can return `none`. Candidate options are sorted by
+Skill ID and carry no recall score or previous ordering. The result includes
+`candidate_choice_scores`, `candidate_fit_scores`, and `reranker_model` for diagnostics.
+
+For an in-process integration, construct `JevReranker.from_policy(policy,
+api_key=secret)` and pass it as `jev_reranker`. For a subprocess integration, add
+`--jev-api-key-file <harness-secret-path-or-/dev/fd/N>` only to the second call.
+Keep the key out of routing JSON, environment variables, state, output, and logs.
+The first-stage call needs no credential. A small enabled set returns `bypass` on
+the first call. Version drift, unknown enabled IDs, full-catalog `skills` input,
+stale candidate metadata, missing vector cache, missing Jev injection, service
+failure, malformed probabilities, and an out-of-set winner fail closed with `error`;
+the harness owns fallback behavior.
 
 ## State ownership
 
-The harness owns Skill metadata and enabled state. The enhancer owns manual/native/generated tag assignments, its derived tag-to-Skill index, and aggregate accuracy counters. Derived vectors are persisted for reuse and maintained by lifecycle events; repeat `initialize` with the identical full snapshot or use explicit `rebuild` to recover a missing or incompatible cache. Routing below the activation threshold still returns `bypass`; initialization and lifecycle maintenance continue regardless of catalog size.
+The harness owns Skill metadata, enabled state, and the native selector used as the shadow baseline. The enhancer owns manual/native/generated tag assignments, its derived tag-to-Skill index, and aggregate comparison corrections. Derived vectors are persisted for reuse and maintained by lifecycle events; repeat `initialize` with the identical full snapshot or use explicit `rebuild` to recover a missing or incompatible cache. Routing below the activation threshold still returns `bypass`; initialization and lifecycle maintenance continue regardless of catalog size.

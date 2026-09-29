@@ -1,6 +1,6 @@
 ---
 name: enhance-skill-retrieval
-description: Maintain user and agent-assigned tags for a harness-provided Skill catalog, benchmark large-catalog retrieval, and improve Skill selection using sampled post-task accuracy feedback. Use when a harness initializes or synchronizes tags, a user edits or inspects Skill tags, retrieval speed needs comparison, completed Skill use may request feedback, or a large Skill catalog needs tag-first candidate retrieval followed by metadata vector ranking. Do not use for installing, deleting, or storing Skills, and bypass tag retrieval for small catalogs.
+description: Maintain tags for a harness-provided Skill catalog and route large catalogs with tag-first recall plus TypeSafe Jev semantic selection. Use when a harness initializes or synchronizes tags, a user edits or inspects Skill tags, retrieval behavior needs comparison, or candidate Skills need Jev reranking. Do not use for installing, deleting, or storing Skills, and bypass tag retrieval for small catalogs.
 ---
 
 # Enhance Skill Retrieval
@@ -13,11 +13,11 @@ Keep the harness registry as the source of truth for Skill metadata. Persist onl
 - Explicitly rebuild from a changed complete snapshot only for recovery, migration, or taxonomy changes: run `scripts/manage_tags.py rebuild`.
 - Apply a normal harness install, update, or removal event: run `scripts/manage_tags.py sync`.
 - Let users inspect and edit tags through the stable `enhance-skill` command in `scripts/enhance-skill`.
-- Route a user request when the harness catalog exceeds its activation threshold: first call `scripts/route_query.py` with only `query`, `registry_version`, and `enabled_skill_ids`; after it returns candidate IDs, have the harness load only those Skill metadata records and call it again with `candidate_skills`.
-- Measure retrieval behavior against JSONL cases: run `scripts/evaluate_retrieval.py`.
-- Compare enhanced and full-metadata query rates: run `scripts/benchmark_retrieval.py`.
+- Route a user request when the harness catalog exceeds its activation threshold: first call `scripts/route_query.py` with only `query`, `registry_version`, and `enabled_skill_ids`; after it returns candidate IDs, have the harness load only those Skill metadata records and call it again with `candidate_skills`. Inject a configured `JevReranker` for the second stage; subprocess harnesses pass a secret file or inherited descriptor through `--jev-api-key-file`.
+- Measure retrieval behavior against JSONL cases with a harness-owned Jev secret file: run `scripts/evaluate_retrieval.py --jev-api-key-file <path>`.
+- Compare enhanced and full-metadata query rates with a harness-owned Jev secret file: run `scripts/benchmark_retrieval.py --jev-api-key-file <path>`.
 
-Read [references/protocol.md](references/protocol.md) before integrating a new harness. Read [references/feedback-protocol.md](references/feedback-protocol.md) before collecting feedback. Read [references/tag-taxonomy.yaml](references/tag-taxonomy.yaml) only when changing controlled tags or reviewing classification.
+Read [references/protocol.md](references/protocol.md) before integrating a new harness. Read [references/feedback-protocol.md](references/feedback-protocol.md) before enabling automatic shadow comparisons. Read [references/tag-taxonomy.yaml](references/tag-taxonomy.yaml) only when changing controlled tags or reviewing classification.
 
 ## Use the stable tag commands
 
@@ -33,23 +33,29 @@ Expose `scripts/enhance-skill` on `PATH` as `enhance-skill` and set `ENHANCE_SKI
 - `enhance-skill lock-tags <skill-id> <tag>...`
 - `enhance-skill unlock-tags <skill-id> <tag>...`
 - `enhance-skill reclassify-tags <skill-id> --input <skill.json>`
-- `enhance-skill request-feedback --interaction-id <id> --route-result <result.json> --query <query>`
-- `enhance-skill record-feedback --interaction-id <id> --rating accurate`
-- `enhance-skill record-feedback --interaction-id <id> --rating inaccurate --expected-skill-id <id> --expected-tags <tag>...`
-- `enhance-skill record-feedback --interaction-id <id> --rating inaccurate --expected-none`
-- `enhance-skill feedback-status [skill-id]`
+- `enhance-skill compare-routing --comparison-id <id> --enhanced-result <result.json> --baseline-result <result.json> --query <query>`
+- `enhance-skill comparison-status [skill-id]`
 
 Add `--json` before the subcommand for structured output. Keep `manage_tags.py` as the harness integration interface for initialization and lifecycle synchronization; do not expose its shorter internal mutation names as additional user commands.
 
-## Collect feedback after completion
+## Learn from native-route comparisons
 
-1. Ask only after a task completed with an `invoke` decision; never ask for `none`, `bypass`, or `error`.
-2. Let `request-feedback` apply the configured 10% deterministic-random sample to the harness interaction ID.
-3. Present one optional accurate/inaccurate question only when `sampled` is true.
-4. For negative feedback, require the correct Skill plus user-intent tags, or `expected-none`.
-5. Compare intent tags with matched tags and the correct Skill's effective tags. Classify query-tag mismatch, Skill-tag annotation error, candidate recall error, and rerank error independently.
-6. Consume the pending request so a second answer is rejected. Store no raw interaction ID or query; persist only bounded hashes, derived vectors, and aggregate corrections.
-7. Apply each correction only after 5 matching samples. Correct query-to-tag scores, virtual candidate tags, and reranking through separate channels.
+1. Run the enhanced route and the harness native route independently for the same query, registry version, and enabled Skill set; require both results to carry the same enabled-ID digest.
+2. Treat the native route's selected Skill, or native `none`, as the pseudo-correct result. Do not ask the user to rate the selection.
+3. Let the harness pass only the two route results and query to `compare-routing`; ordinary enhanced routing still receives no complete Skill catalog.
+4. Infer the query's intended controlled tag from the native-selected Skill's effective tags, then classify query-tag mismatch, candidate recall error, rerank error, or over-recall.
+5. Hash and bound comparison IDs for idempotency. Store no raw comparison ID or query.
+6. Apply a correction only after 5 matching comparisons and keep all score movements capped. A single native-route error must not immediately change routing.
+
+## Use Jev for the final decision
+
+1. Keep the first stage deterministic and high-recall. Its tag and hash-vector scores produce candidate IDs only.
+2. Send every recalled candidate's name, description, aliases, and tags to Jev in one request. Sort options by Skill ID and omit recall scores and prior ordering.
+3. Use one `Choice` answer to select among candidates and one `Noul` answer per candidate to decide whether any candidate truly fits.
+4. Return `none` when every fit probability is below `jev_fit_threshold`. Otherwise return the `Choice` winner; expose Choice and fit probabilities as diagnostics, not accuracy claims.
+5. Validate that every returned probability is finite and bounded and that the winner belongs to the freshly recalled enabled set.
+6. Require the harness to construct and inject the Jev client with its TypeSafe API key. For subprocess integration, read the key only from the harness-owned path supplied by `--jev-api-key-file`; keep credentials out of routing JSON, environment variables, state, output, and logs.
+7. Fail closed with `error` on missing injection, timeout, service failure, malformed output, or an out-of-set winner. Let the harness choose its native fallback.
 
 ## Preserve ownership boundaries
 
@@ -59,7 +65,7 @@ Add `--json` before the subcommand for structured output. Keep `manage_tags.py` 
 4. After initialization, process only normal harness `skill_added`, `skill_updated`, and `skill_removed` events in v1; update the affected tag postings and metadata vector incrementally.
 5. Preserve manual and locked tags when metadata changes.
 6. Return `bypass` for routing when the catalog does not exceed the configured threshold. Continue maintaining indexes below the threshold so later activation needs no full rebuild.
-7. Return one Skill only when it clears the score and winner-margin rules; otherwise return `none`.
+7. Return one Skill only when Jev selects a recalled candidate and at least one candidate clears the calibrated fit gate; otherwise return `none`.
 8. Fail closed with `error`; let the harness decide whether to use its native fallback.
 9. Never pass the complete Skill catalog during ordinary routing. Require the rerank metadata set to exactly match the freshly recalled candidate IDs and validate each metadata fingerprint.
 
@@ -68,7 +74,7 @@ Add `--json` before the subcommand for structured output. Keep `manage_tags.py` 
 Require a writable `state_dir` supplied by the harness. Store:
 
 - `skill-tags.yaml`: persistent tag assignments plus the tag-to-Skill inverted index in JSON-compatible YAML.
-- `feedback-stats.json`: aggregate feedback, bounded pending hashes, derived correction vectors, and root-cause counters.
+- `feedback-stats.json`: aggregate shadow-comparison counts, bounded comparison hashes, derived correction vectors, and root-cause counters.
 - `vector-cache.json`: persistent tag and Skill-metadata vectors maintained by initialization and lifecycle events; recover it by repeating `initialize` with the identical full snapshot or by explicit `rebuild`.
 
 Never place dynamic state in this installed Skill directory. Never store full `SKILL.md` bodies.
@@ -77,6 +83,7 @@ Never place dynamic state in this installed Skill directory. Never store full `S
 
 - Activate tag retrieval above 80 enabled Skills.
 - Retrieve up to 5 tags and 32 candidate Skills.
+- Use `jev-latest` with a 5-second timeout, two attempts, and a 0.30 fit gate. Calibrate the gate against harness golden cases before production use.
 - Prefer manual locked tags, then native tags, then agent-generated controlled tags.
 - Keep the controlled taxonomy stable. Treat unknown model suggestions as auxiliary tags until a user approves them.
 

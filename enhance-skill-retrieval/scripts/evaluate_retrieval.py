@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from jev_reranker import JevReranker, read_harness_api_key
 from retrieval_core import load_resources, load_state, route, write_json
 
 
@@ -15,6 +16,11 @@ def main() -> int:
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--cases", required=True)
     parser.add_argument("--threshold", type=int, default=0, help="Use 0 to force enhanced retrieval")
+    parser.add_argument(
+        "--jev-api-key-file",
+        required=True,
+        help="Harness-owned file containing the TypeSafe API key",
+    )
     args = parser.parse_args()
     with open(args.catalog, "r", encoding="utf-8") as handle:
         catalog = json.load(handle)
@@ -22,6 +28,10 @@ def main() -> int:
         cases = [json.loads(line) for line in handle if line.strip()]
     taxonomy, policy, provider = load_resources()
     state = load_state(args.state_dir)
+    jev_reranker = JevReranker.from_policy(
+        policy,
+        api_key=read_harness_api_key(args.jev_api_key_file),
+    )
     checked = correct = 0
     failures = []
     for case in cases:
@@ -35,7 +45,14 @@ def main() -> int:
             "activation_threshold": args.threshold,
             "skills": catalog["skills"],
         }
-        result = route(payload, state, taxonomy, policy, provider)
+        result = route(
+            payload,
+            state,
+            taxonomy,
+            policy,
+            provider,
+            jev_reranker=jev_reranker,
+        )
         checked += 1
         passed = result["decision"] == expected and (
             expected != "invoke" or result.get("selected_skill_id") == expected_skill

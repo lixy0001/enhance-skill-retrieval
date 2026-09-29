@@ -15,8 +15,7 @@ from retrieval_core import (
     load_resources,
     load_state,
     mutate_tags,
-    record_pending_feedback,
-    register_feedback_request,
+    record_shadow_comparison,
     reclassify_record,
     read_json,
     save_feedback_state,
@@ -65,26 +64,20 @@ def build_parser() -> argparse.ArgumentParser:
     reclassify.add_argument("skill_id")
     reclassify.add_argument("--input", default="-", help="JSON Skill object; defaults to stdin")
 
-    request_feedback = sub.add_parser(
-        "request-feedback", help="Sample whether to ask for feedback after a completed task"
+    compare = sub.add_parser(
+        "compare-routing",
+        help="Compare enhanced routing with the harness native route and learn automatically",
     )
-    request_feedback.add_argument("--interaction-id", required=True)
-    request_feedback.add_argument("--route-result", required=True, help="JSON route result file")
-    request_feedback.add_argument("--query", required=True, help="Completed task query; vectorized but not stored")
-    request_feedback.add_argument("--sample-rate", type=float)
-    request_feedback.add_argument("--sampling-salt", default="")
+    compare.add_argument("--comparison-id", required=True)
+    compare.add_argument("--enhanced-result", required=True, help="Enhanced route result JSON")
+    compare.add_argument("--baseline-result", required=True, help="Native harness route result JSON")
+    compare.add_argument("--query", required=True, help="Compared query; vectorized but not stored")
+    compare.add_argument("--comparison-salt", default="")
 
-    record = sub.add_parser("record-feedback", help="Record an accurate or inaccurate selection")
-    record.add_argument("--interaction-id", required=True)
-    record.add_argument("--rating", choices=("accurate", "inaccurate"), required=True)
-    expected = record.add_mutually_exclusive_group()
-    expected.add_argument("--expected-skill-id")
-    expected.add_argument("--expected-none", action="store_true")
-    record.add_argument("--expected-tags", nargs="*", default=[])
-    record.add_argument("--sampling-salt", default="")
-
-    feedback_status = sub.add_parser("feedback-status", help="Show aggregate feedback counts")
-    feedback_status.add_argument("skill_id", nargs="?")
+    comparison_status = sub.add_parser(
+        "comparison-status", help="Show aggregate shadow-routing comparison counts"
+    )
+    comparison_status.add_argument("skill_id", nargs="?")
 
     sub.add_parser("status", help="Show tag-library status and activation threshold")
     return parser
@@ -170,20 +163,17 @@ def emit(data: Mapping[str, Any], as_json: bool) -> None:
         print(f"skill_count: {data['skill_count']}")
         print(f"activation_threshold: {data['activation_threshold']}")
         print(f"tag_retrieval: {data['tag_retrieval']}")
-    elif kind == "feedback-request":
-        print(f"sampled: {'yes' if data['sampled'] else 'no'}")
-        if data.get("question"):
-            print(data["question"])
-    elif kind == "feedback-status":
-        print(f"total_responses: {data['total_responses']}")
+    elif kind == "comparison-status":
+        print(f"total_comparisons: {data['total_comparisons']}")
+        print(f"agreements: {data['agreements']}")
+        print(f"disagreements: {data['disagreements']}")
         print(f"root_causes: {json.dumps(data.get('root_causes', {}), ensure_ascii=False)}")
         for skill_id, counts in data["skills"].items():
-            print(f"{skill_id}\taccurate={counts.get('positive', 0)}\tinaccurate={counts.get('negative', 0)}")
-    elif kind == "feedback-recorded":
-        print(f"Skill: {data['skill_id']}")
-        print(f"rating: {data['rating']}")
-        print(f"accurate: {data['skill_counts'].get('positive', 0)}")
-        print(f"inaccurate: {data['skill_counts'].get('negative', 0)}")
+            print(f"{skill_id}\tbaseline-selected={counts.get('positive', 0)}\tbaseline-rejected={counts.get('negative', 0)}")
+    elif kind == "routing-comparison":
+        print(f"agreement: {'yes' if data['agreement'] else 'no'}")
+        print(f"enhanced_skill_id: {data.get('enhanced_skill_id') or '-'}")
+        print(f"baseline_skill_id: {data.get('baseline_skill_id') or '-'}")
         print(f"root_causes: {', '.join(data.get('root_causes', []))}")
     else:
         print(f"Skill: {data['skill_id']}")
@@ -202,57 +192,30 @@ def main() -> int:
         if args.assigned_only:
             rows = [row for row in rows if row["assigned_skill_count"]]
         output: Dict[str, Any] = {"kind": "tags", "tags": rows}
-    elif args.command == "request-feedback":
+    elif args.command == "compare-routing":
         state_dir = require_state_dir(args.state_dir)
         state = load_state(state_dir)
-        route_result = read_json(args.route_result)
-        if route_result.get("decision") != "invoke":
-            raise ValueError("feedback requires an invoke route result")
-        selected_skill_id = route_result.get("selected_skill_id")
-        if selected_skill_id not in state.get("skills", {}):
-            raise KeyError(f"unknown skill_id: {selected_skill_id}")
-        effective_tags = set(state["skills"][selected_skill_id].get("effective_tags", []))
-        feedback_tags = route_result.get("feedback_tags", [])
-        invalid_tags = sorted(set(feedback_tags) - effective_tags)
-        if invalid_tags:
-            raise ValueError(
-                "feedback tags are not assigned to the selected Skill: "
-                + ", ".join(invalid_tags)
-            )
-        sample_rate = (
-            args.sample_rate
-            if args.sample_rate is not None
-            else float(policy.get("feedback_sample_rate", 0.10))
+        vector_cache = load_vector_cache(
+            state_dir, state, taxonomy, provider, required=True
         )
+        enhanced_result = read_json(args.enhanced_result)
+        baseline_result = read_json(args.baseline_result)
         feedback = load_feedback_state(state_dir)
-        sampled = register_feedback_request(
+        recorded = record_shadow_comparison(
             feedback,
-            args.interaction_id,
-            route_result,
-            provider.embed(args.query),
-            sample_rate,
-            args.sampling_salt,
-            int(policy.get("feedback_pending_limit", 1000)),
+            args.comparison_id,
+            args.query,
+            enhanced_result,
+            baseline_result,
+            state,
+            taxonomy,
+            provider,
+            vector_cache,
+            int(policy.get("comparison_history_limit", 1000)),
+            args.comparison_salt,
         )
-        if sampled:
-            save_feedback_state(state_dir, feedback)
-        output = {
-            "kind": "feedback-request",
-            "sampled": sampled,
-            "skill_id": selected_skill_id,
-            "feedback_tags": feedback_tags,
-            "sample_rate": sample_rate,
-            "question": (
-                f"本次使用的 Skill“{selected_skill_id}”是否准确？请选择：准确 / 不准确"
-                if sampled
-                else None
-            ),
-            "negative_followup": (
-                "若不准确，请提供正确 Skill（或无需 Skill）以及用户需求对应的标签。"
-                if sampled
-                else None
-            ),
-        }
+        save_feedback_state(state_dir, feedback)
+        output = {"kind": "routing-comparison", **recorded}
     elif args.command == "status":
         if state_dir:
             path = state_path(state_dir)
@@ -314,48 +277,16 @@ def main() -> int:
                 ),
             )
             output = {"kind": "updated", "status": "reclassified", "skill_id": args.skill_id, "record": record}
-        elif args.command == "record-feedback":
-            if args.rating == "accurate" and (
-                args.expected_skill_id or args.expected_none or args.expected_tags
-            ):
-                raise ValueError("accurate feedback must not include expected corrections")
-            if args.rating == "inaccurate" and not (
-                args.expected_none or (args.expected_skill_id and args.expected_tags)
-            ):
-                raise ValueError(
-                    "inaccurate feedback requires expected_skill_id with expected_tags, or expected_none"
-                )
-            if args.expected_none and args.expected_tags:
-                raise ValueError("expected_none must not include expected_tags")
-            controlled_tags = {item["id"] for item in taxonomy.get("tags", [])}
-            invalid_expected = sorted(set(args.expected_tags) - controlled_tags)
-            if invalid_expected:
-                raise ValueError(
-                    "expected tags must be controlled tags: " + ", ".join(invalid_expected)
-                )
-            if args.expected_skill_id and args.expected_skill_id not in state.get("skills", {}):
-                raise KeyError(f"unknown skill_id: {args.expected_skill_id}")
-            feedback = load_feedback_state(state_dir)
-            recorded = record_pending_feedback(
-                feedback,
-                args.interaction_id,
-                args.rating == "accurate",
-                state,
-                args.expected_skill_id,
-                args.expected_tags,
-                args.expected_none,
-                args.sampling_salt,
-            )
-            save_feedback_state(state_dir, feedback)
-            output = {"kind": "feedback-recorded", **recorded}
-        elif args.command == "feedback-status":
+        elif args.command == "comparison-status":
             feedback = load_feedback_state(state_dir)
             skills = feedback.get("skills", {})
             if args.skill_id:
                 skills = {args.skill_id: skills.get(args.skill_id, {"positive": 0, "negative": 0})}
             output = {
-                "kind": "feedback-status",
-                "total_responses": feedback.get("total_responses", 0),
+                "kind": "comparison-status",
+                "total_comparisons": feedback.get("total_comparisons", 0),
+                "agreements": feedback.get("agreements", 0),
+                "disagreements": feedback.get("disagreements", 0),
                 "skills": skills,
                 "root_causes": feedback.get("root_causes", {}),
                 "rerank_skills": (
